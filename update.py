@@ -73,4 +73,4 @@ def main():
     finalize()
 
 if __name__ == '__main__':
-    main()
+    sys.exit(0)#main() # deprecates the script by ...not allowing it to be called

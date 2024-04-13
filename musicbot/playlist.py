@@ -7,7 +7,7 @@ from itertools import islice
 from collections import deque
 
 from urllib.error import URLError
-from youtube_dl.utils import ExtractorError, DownloadError, UnsupportedError
+from yt_dlp.utils import ExtractorError, DownloadError, UnsupportedError # katie 2023-02-18: changed youtube_dl to yt-dlp
 
 from .utils import get_header
 from .constructs import Serializable
@@ -140,7 +140,7 @@ class Playlist(EventEmitter, Serializable):
             except Exception as e:
                 log.error('Could not extract information from {} ({}), falling back to direct'.format(song_url, e), exc_info=True)
 
-        if info.get('is_live') is None and info.get('extractor', None) is not 'generic':  # wew hacky
+        if info.get('is_live') is None and info.get('extractor', None) != 'generic':  # wew hacky
             raise ExtractionError("This is not a stream.")
 
         dest_url = song_url

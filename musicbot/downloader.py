@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import functools
-import youtube_dl
+import yt_dlp as youtube_dl #sneaky little switcheroo
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,6 +10,7 @@ log = logging.getLogger(__name__)
 
 ytdl_format_options = {
     'format': 'bestaudio/best',
+    #'outtmpl': '/home/pi/MusicBot/audio_cache/%(extractor)s-%(id)s-%(title)s.%(ext)s', #did this break it?
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': True,
@@ -20,7 +21,8 @@ ytdl_format_options = {
     'no_warnings': True,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
-    'usenetrc': True
+    'usenetrc': True,
+    'cookiefile': '/home/pi/MusicBot/cookies.txt'
 }
 
 # Fuck your useless bugreports message that gets two link embeds and confuses users
@@ -43,12 +45,12 @@ class Downloader:
         self.download_folder = download_folder
 
         if download_folder:
-            otmpl = self.unsafe_ytdl.params['outtmpl']
-            self.unsafe_ytdl.params['outtmpl'] = os.path.join(download_folder, otmpl)
+            otmpl = self.unsafe_ytdl.params['outtmpl']['default'] # yt-dlp seems to have changed this to a dict. get the item "default"
+            self.unsafe_ytdl.params['outtmpl']['default'] = os.path.join(download_folder, otmpl)
             # print("setting template to " + os.path.join(download_folder, otmpl))
 
-            otmpl = self.safe_ytdl.params['outtmpl']
-            self.safe_ytdl.params['outtmpl'] = os.path.join(download_folder, otmpl)
+            otmpl = self.safe_ytdl.params['outtmpl']['default'] # same here
+            self.safe_ytdl.params['outtmpl']['default'] = os.path.join(download_folder, otmpl)
 
 
     @property

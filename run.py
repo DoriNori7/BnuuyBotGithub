@@ -176,7 +176,7 @@ def finalize_logging():
     dlog = logging.getLogger('discord')
     dlh = logging.StreamHandler(stream=sys.stdout)
     dlh.terminator = ''
-    dlh.setFormatter(logging.Formatter('.'))
+    dlh.setFormatter(logging.Formatter())#'.'))
     dlog.addHandler(dlh)
 
 
@@ -218,19 +218,19 @@ def sanity_checks(optional=True):
 
 
 def req_ensure_py3():
-    log.info("Checking for Python 3.5+")
+    log.info("Checking for Python 3.8+")
 
-    if sys.version_info < (3, 5):
-        log.warning("Python 3.5+ is required. This version is %s", sys.version.split()[0])
-        log.warning("Attempting to locate Python 3.5...")
+    if sys.version_info < (3, 8):
+        log.warning("Python 3.7+ is required. This version is %s", sys.version.split()[0])
+        log.warning("Attempting to locate Python 3.7...")
 
         pycom = None
 
         if sys.platform.startswith('win'):
-            log.info('Trying "py -3.5"')
+            log.info('Trying "py -3.8"')
             try:
-                subprocess.check_output('py -3.5 -c "exit()"', shell=True)
-                pycom = 'py -3.5'
+                subprocess.check_output('py -3.8 -c "exit()"', shell=True)
+                pycom = 'py -3.8'
             except:
 
                 log.info('Trying "python3"')
@@ -249,9 +249,9 @@ def req_ensure_py3():
                 sys.exit(0)
 
         else:
-            log.info('Trying "python3.5"')
+            log.info('Trying "python3.8"')
             try:
-                pycom = subprocess.check_output('python3.5 -c "exit()"'.split()).strip().decode()
+                pycom = subprocess.check_output('python3.8 -c "exit()"'.split()).strip().decode()
             except:
                 pass
 
@@ -259,15 +259,15 @@ def req_ensure_py3():
                 log.info("\nPython 3 found.  Re-launching bot using: %s run.py\n", pycom)
                 pyexec(pycom, 'run.py')
 
-        log.critical("Could not find Python 3.5 or higher.  Please run the bot using Python 3.5")
+        log.critical("Could not find Python 3.8 or higher.  Please run the bot using Python 3.8")
         bugger_off()
 
 
 def req_check_deps():
     try:
         import discord
-        if discord.version_info.major < 1:
-            log.critical("This version of MusicBot requires a newer version of discord.py (1.0+). Your version is {0}. Try running update.py.".format(discord.__version__))
+        if discord.version_info.major < 2:
+            log.critical("This version of MusicBot requires a newer version of discord.py (2.0+). Your version is {0}. Try running update.py.".format(discord.__version__))
             bugger_off()
     except ImportError:
         # if we can't import discord.py, an error will be thrown later down the line anyway
@@ -379,7 +379,7 @@ def main():
         except ImportError:
             # TODO: if error module is in pip or dpy requirements...
 
-            if not tried_requirementstxt:
+            if False: #not tried_requirementstxt: # katie note 2023-02-18: after migrating to poetry the requirements.txt file is obsolete. it was obsolete anyways
                 tried_requirementstxt = True
 
                 log.exception("Error starting bot")
@@ -397,7 +397,7 @@ def main():
                     log.info("Ok lets hope it worked")
                     print()
             else:
-                log.exception("Unknown ImportError, exiting.")
+                log.exception("Unknown ImportError (missing dependency), exiting.")
                 break
 
         except Exception as e:

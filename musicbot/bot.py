@@ -1,3 +1,4 @@
+from distutils.util import split_quoted
 import os
 import sys
 import time
@@ -11,16 +12,23 @@ import pathlib
 import traceback
 import math
 import re
+import textwrap
+import json
+import csv
+
+from subprocess import check_output
 
 import aiohttp
 import discord
+from discord.ext import tasks
 import colorlog
 
 from io import BytesIO, StringIO
 from functools import wraps
 from textwrap import dedent
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from collections import defaultdict
+from quantumrandom import get_data
 
 from discord.enums import ChannelType
 
@@ -38,16 +46,22 @@ from .constructs import SkipState, Response
 from .utils import load_file, write_file, fixg, ftimedelta, _func_, _get_variable
 from .spotify import Spotify
 from .json import Json
+from .scorekeeper import Scorekeeper
 
 from .constants import VERSION as BOTVERSION
 from .constants import DISCORD_MSG_CHAR_LIMIT, AUDIO_CACHE_PATH
+
+
+from .emojipasta.generator import EmojipastaGenerator
+from .robertdowneyjr.rdj import rdj
+
 
 load_opus_lib()
 
 log = logging.getLogger(__name__)
 
-
 class MusicBot(discord.Client):
+            
     def __init__(self, config_file=None, perms_file=None, aliases_file=None):
         try:
             sys.stdout.write("\x1b]2;MusicBot {}\x07".format(BOTVERSION))
@@ -64,6 +78,13 @@ class MusicBot(discord.Client):
 
         if aliases_file is None:
             aliases_file = AliasesDefault.aliases_file
+
+        self.load_configs() #loads the custom configs. TODO -- can this be moved to the config.py file and integrated into the existing config parser?
+        self.set_secret_word()
+        self.next_reminder = self.get_next_reminder()
+        self.scorekeeper = Scorekeeper()
+        self.days_until_reboot = random.randint(5,10)
+        print("Days until reboot: "+str(self.days_until_reboot))
 
         self.players = {}
         self.exit_signal = None
@@ -106,9 +127,11 @@ class MusicBot(discord.Client):
         }
         self.server_specific_data = defaultdict(ssd_defaults.copy)
 
-        super().__init__()
-        self.aiosession = aiohttp.ClientSession(loop=self.loop)
+        #run discord.Client init and enable all intents
+        super().__init__(intents=discord.Intents.all(), activity=discord.Game(name="Emotion: "+self.get_daily_emotion()))
+
         self.http.user_agent += ' MusicBot/%s' % BOTVERSION
+        self.aiosession = aiohttp.ClientSession()
 
         self.spotify = None
         if self.config._spotify:
@@ -124,6 +147,11 @@ class MusicBot(discord.Client):
                 self.config._spotify = False
                 time.sleep(5)  # make sure they see the problem
 
+
+        
+        # FIXME: Load cogs here.
+
+
     # TODO: Add some sort of `denied` argument for a message to send when someone else tries to use it
     def owner_only(func):
         @wraps(func)
@@ -135,8 +163,8 @@ class MusicBot(discord.Client):
                 # noinspection PyCallingNonCallable
                 return await func(self, *args, **kwargs)
             else:
-                raise exceptions.PermissionsError("Only the owner can use this command.", expire_in=30)
-
+                raise exceptions.PermissionsError("THOUGHT CRIME!! Only the owner can use this command.", expire_in=30)
+        wrapper.owner_cmd = True
         return wrapper
 
     def dev_only(func):
@@ -144,11 +172,11 @@ class MusicBot(discord.Client):
         async def wrapper(self, *args, **kwargs):
             orig_msg = _get_variable('message')
 
-            if str(orig_msg.author.id) in self.config.dev_ids:
+            if not orig_msg or str(orig_msg.author.id) in self.config.dev_ids:
                 # noinspection PyCallingNonCallable
                 return await func(self, *args, **kwargs)
             else:
-                raise exceptions.PermissionsError("Only dev users can use this command.", expire_in=30)
+                raise exceptions.PermissionsError("THOUGHT CRIME!! Only dev users can use this command.", expire_in=30)
 
         wrapper.dev_cmd = True
         return wrapper
@@ -244,7 +272,6 @@ class MusicBot(discord.Client):
                 return False
 
             return True
-
         return not sum(1 for m in vchannel.members if check(m))
 
     async def _join_startup_channels(self, channels, *, autosummon=True):
@@ -331,7 +358,7 @@ class MusicBot(discord.Client):
             vc = None
 
         # If we've connected to a voice chat and we're in the same voice channel
-        if not vc or (msg.author.voice and vc == msg.author.voice.channel):
+        if not vc or (msg.author.voice and vc == msg.author.voice.channel) or msg.author.bot : #(I added the bot case for the Siri-conrtolled webhook)
             return True
         else:
             raise exceptions.PermissionsError(
@@ -383,7 +410,8 @@ class MusicBot(discord.Client):
         if channel.guild.voice_client:
             return channel.guild.voice_client
         else:
-            return await channel.connect(timeout=60, reconnect=True)
+            #print("CON")
+            return await channel.connect(self_deaf=True) #PROBLEM ZONE
 
     async def disconnect_voice_client(self, guild):
         vc = self.voice_client_in(guild)
@@ -415,17 +443,22 @@ class MusicBot(discord.Client):
 
     async def get_player(self, channel, create=False, *, deserialize=False) -> MusicPlayer:
         guild = channel.guild
+        #print("GETTING PLAYER")
 
         async with self.aiolocks[_func_() + ':' + str(guild.id)]:
+            #print("A")
             if deserialize:
+                #print("AA")
                 voice_client = await self.get_voice_client(channel)
+                #print("AAB")
                 player = await self.deserialize_queue(guild, voice_client)
-
+                #print("BB")
                 if player:
                     log.debug("Created player via deserialization for guild %s with %s entries", guild.id, len(player.playlist))
                     # Since deserializing only happens when the bot starts, I should never need to reconnect
                     return self._init_player(player, guild=guild)
-
+                #print("CC")
+            #print("B")
             if guild.id not in self.players:
                 if not create:
                     raise exceptions.CommandError(
@@ -437,7 +470,8 @@ class MusicBot(discord.Client):
                 playlist = Playlist(self)
                 player = MusicPlayer(self, voice_client, playlist)
                 self._init_player(player, guild=guild)
-
+            #print("C")
+        #print("RET")
         return self.players[guild.id]
 
     def _init_player(self, player, *, guild=None):
@@ -478,8 +512,9 @@ class MusicBot(discord.Client):
                     player.voice_client.channel.name, entry.title, entry.meta['author'].name)
                 player.skip()
             elif self.config.now_playing_mentions:
+                displayname = "Robot friend" if entry.meta['author'].bot else entry.meta['author'].nick if entry.meta['author'].nick else entry.meta['author'].name
                 newmsg = '%s - your song `%s` is now playing in `%s`!' % (
-                    entry.meta['author'].mention, entry.title, player.voice_client.channel.name)
+                    displayname, entry.title, player.voice_client.channel.name)
             else:
                 newmsg = 'Now playing in `%s`: `%s` added by `%s`' % (
                     player.voice_client.channel.name, entry.title, entry.meta['author'].name)
@@ -870,7 +905,8 @@ class MusicBot(discord.Client):
 
     async def send_typing(self, destination):
         try:
-            return await destination.trigger_typing()
+            # 2023-04-21: Now only sends typing for 10 seconds (consider with typing()?)
+            return await destination.typing() # 2023-04-21: Changed from trigger_typing()
         except discord.Forbidden:
             log.warning("Could not send typing to {}, no permission".format(destination))
 
@@ -881,25 +917,34 @@ class MusicBot(discord.Client):
     def restart_threadsafe(self):
         asyncio.run_coroutine_threadsafe(self.restart(), self.loop)
 
+    # 2023-04-22: Hacked this in to see if I can close the session properly.
+    async def close(self):
+        print("hi")
+        await self.aiosession.close()
+        await super().close()
+
     def _cleanup(self):
         try:
-            self.loop.run_until_complete(self.logout())
-            self.loop.run_until_complete(self.aiosession.close())
+            self.loop.run_until_complete(self.close()) # katie: 2023-02-18: changed from self.logout() to self.close() due to deprecation
+            #self.loop.run_until_complete(self.aiosession.close())
         except: pass
 
-        pending = asyncio.Task.all_tasks()
-        gathered = asyncio.gather(*pending)
+        # 2023-04-22: This is now handled by asyncio.run().
+        #pending = asyncio.all_tasks(self.loop) # katie: 2023-02-18: changed from asyncio.Task.all_tasks() due to deprecation
+        #gathered = asyncio.gather(*pending)
 
-        try:
-            gathered.cancel()
-            self.loop.run_until_complete(gathered)
-            gathered.exception()
-        except: pass
+        #try:
+            #gathered.cancel()
+            #self.loop.run_until_complete(gathered)
+            #gathered.exception()
+        #except: pass
 
     # noinspection PyMethodOverriding
     def run(self):
         try:
-            self.loop.run_until_complete(self.start(*self.config.auth))
+            #super().run(*self.config.auth)
+            asyncio.run(self.start(*self.config.auth))
+            #self.loop.run_until_complete(self.start(*self.config.auth))
 
         except discord.errors.LoginFailure:
             # Add if token, else
@@ -910,10 +955,10 @@ class MusicBot(discord.Client):
             )  #     ^^^^ In theory self.config.auth should never have no items
 
         finally:
-            try:
-                self._cleanup()
-            except Exception:
-                log.error("Error in cleanup", exc_info=True)
+            #try:
+                #self._cleanup()
+            #except Exception:
+                #log.error("Error in cleanup", exc_info=True)
 
             if self.exit_signal:
                 raise self.exit_signal # pylint: disable=E0702
@@ -929,11 +974,11 @@ class MusicBot(discord.Client):
             log.error("Exception in {}:\n{}".format(event, ex.message))
 
             await asyncio.sleep(2)  # don't ask
-            await self.logout()
+            await self.close()
 
         elif issubclass(ex_type, exceptions.Signal):
             self.exit_signal = ex_type
-            await self.logout()
+            await self.close()
 
         else:
             log.error("Exception in {}".format(event), exc_info=True)
@@ -1093,7 +1138,7 @@ class MusicBot(discord.Client):
 
         print(flush=True)
 
-        await self.update_now_playing_status()
+        #await self.update_now_playing_status()
 
         # maybe option to leave the ownerid blank and generate a random command for the owner to use
         # wait_for_message is pretty neato
@@ -1107,14 +1152,21 @@ class MusicBot(discord.Client):
                         'The options missing are: {0}'.format(self.config.missing_keys))
             print(flush=True)
 
+        #Start custom loop(s)
+        self.midnight_loop.start()
+        #await asyncio.sleep(1.-(1000*datetime.now().microsecond)) #this would actually work if the raspi's internal clock was synchronized properly - TODO?
+        self.second_loop.start()
+        print("INITIALIZATION FINISHED!")
+
         # t-t-th-th-that's all folks!
+
 
     def _gen_embed(self):
         """Provides a basic template for embeds"""
         e = discord.Embed()
         e.colour = 7506394
         e.set_footer(text='Just-Some-Bots/MusicBot ({})'.format(BOTVERSION), icon_url='https://i.imgur.com/gFHBoZA.png')
-        e.set_author(name=self.user.name, url='https://github.com/Just-Some-Bots/MusicBot', icon_url=self.user.avatar_url)
+        e.set_author(name=self.user.name, url='https://github.com/Just-Some-Bots/MusicBot', icon_url=self.user.display_avatar.url)
         return e
 
     async def cmd_resetplaylist(self, player, channel):
@@ -1130,6 +1182,8 @@ class MusicBot(discord.Client):
     async def cmd_help(self, message, channel, command=None):
         """
         Usage:
+            {command_prefix}help
+            {command_prefix}help all
             {command_prefix}help [command]
 
         Prints a help message.
@@ -1146,28 +1200,40 @@ class MusicBot(discord.Client):
                 await self.gen_cmd_list(message, list_all_cmds=True)
 
             else:
+                if self.config.usealias:
+                    alias = self.aliases.get(command)
+                    command = alias if alias else command #haha! by making the code harder to read I was able to combine two lines into one!
                 cmd = getattr(self, 'cmd_' + command, None)
-                if cmd and not hasattr(cmd, 'dev_cmd'):
+
+                if cmd and (not hasattr(cmd, 'dev_cmd') or str(message.author.id) in self.config.dev_ids) and (not hasattr(cmd, 'owner_cmd') or message.author.id==self.config.owner_id):
                     return Response(
                         "```\n{}```".format(
                             dedent(cmd.__doc__)
                         ).format(command_prefix=self.config.command_prefix),
                         delete_after=60
                     )
+                elif (hasattr(cmd, 'dev_cmd') and not str(message.author.id) in self.config.dev_ids) or (hasattr(cmd, 'owner_cmd') and not message.author.id==self.config.owner_id):
+                    await channel.send("This is forbidden knowledge.",delete_after=5)
+                    raise exceptions.CommandError(self.str.get('cmd-help-invalid', "This is forbidden knowledge."), expire_in=10)
                 else:
                     raise exceptions.CommandError(self.str.get('cmd-help-invalid', "No such command"), expire_in=10)
 
-        elif message.author.id == self.config.owner_id:
-            await self.gen_cmd_list(message, list_all_cmds=True)
+        #elif message.author.id == self.config.owner_id: #disabling this for Bnuuybot (personal preference) (when enabled, defaults owner's 'help' to 'help all')
+        #    await self.gen_cmd_list(message, list_all_cmds=True)
 
         else:
             await self.gen_cmd_list(message)
 
-        desc = '```\n' + ', '.join(self.commands) + '\n```\n' + self.str.get(
-            'cmd-help-response', 'For information about a particular command, run `{}help [command]`\n'
-                                 'For further help, see https://just-some-bots.github.io/MusicBot/').format(prefix)
-        if not self.is_all:
-            desc += self.str.get('cmd-help-all', '\nOnly showing commands you can use, for a list of all commands, run `{}help all`').format(prefix)
+        desc = '```\n' + ', '.join(self.commands) + '\n```\n' + \
+            'For information about a particular command, run `{}help [command]`\n \
+            Bnuuy\'s code is an extensively modified version of https://just-some-bots.github.io/MusicBot/'.format(prefix) #TODO - figure out why this doesn't display
+        #if not self.is_all:
+        #    desc += self.str.get('cmd-help-all', '\nOnly showing commands you can use, for a list of all commands, run `{}help all`').format(prefix)
+
+        if isinstance(channel, discord.abc.PrivateChannel):
+            desc += "\n\nThis is a DM channel, so only the commands you can use here are displayed.\nFor a full list of commands, run `"+prefix+"help all`"
+        elif not channel.id in self.config.bound_channels:
+            desc += "\n\nThis is not the designated BnuuyBot channel for this server, so only the commands you can use in this channel are displayed.\nFor a full list of commands, run `"+prefix+"help all`"
 
         return Response(desc, reply=True, delete_after=60)
 
@@ -1315,277 +1381,280 @@ class MusicBot(discord.Client):
         equivalent of the song. Streaming from Spotify is not possible.
         """
 
+        await channel.send("Working... (Pwease be patient while I locate the cassette tapes, this can sometimes take a few minutes)\n(Longer songs will take longer to download)", delete_after=30)
+
         song_url = song_url.strip('<>')
 
-        await self.send_typing(channel)
+        async with channel.typing(): # awaitself.send_typing(channel)
 
-        if leftover_args:
-            song_url = ' '.join([song_url, *leftover_args])
-        leftover_args = None  # prevent some crazy shit happening down the line
+            if leftover_args:
+                song_url = ' '.join([song_url, *leftover_args])
+            leftover_args = None  # prevent some crazy shit happening down the line
 
-        # Make sure forward slashes work properly in search queries
-        linksRegex = '((http(s)*:[/][/]|www.)([a-z]|[A-Z]|[0-9]|[/.]|[~])*)'
-        pattern = re.compile(linksRegex)
-        matchUrl = pattern.match(song_url)
-        song_url = song_url.replace('/', '%2F') if matchUrl is None else song_url
+            # Make sure forward slashes work properly in search queries
+            linksRegex = '((http(s)*:[/][/]|www.)([a-z]|[A-Z]|[0-9]|[/.]|[~])*)'
+            pattern = re.compile(linksRegex)
+            matchUrl = pattern.match(song_url)
+            song_url = song_url.replace('/', '%2F') if matchUrl is None else song_url
 
-        # Rewrite YouTube playlist URLs if the wrong URL type is given
-        playlistRegex = r'watch\?v=.+&(list=[^&]+)'
-        matches = re.search(playlistRegex, song_url)
-        groups = matches.groups() if matches is not None else []
-        song_url = "https://www.youtube.com/playlist?" + groups[0] if len(groups) > 0 else song_url
+            # Rewrite YouTube playlist URLs if the wrong URL type is given
+            playlistRegex = r'watch\?v=.+&(list=[^&]+)'
+            matches = re.search(playlistRegex, song_url)
+            groups = matches.groups() if matches is not None else []
+            song_url = "https://www.youtube.com/playlist?" + groups[0] if len(groups) > 0 else song_url
 
-        if self.config._spotify:
-            if 'open.spotify.com' in song_url:
-                song_url = 'spotify:' + re.sub('(http[s]?:\/\/)?(open.spotify.com)\/', '', song_url).replace('/', ':')
-                # remove session id (and other query stuff)
-                song_url = re.sub('\?.*', '', song_url)
-            if song_url.startswith('spotify:'):
-                parts = song_url.split(":")
-                try:
-                    if 'track' in parts:
-                        res = await self.spotify.get_track(parts[-1])
-                        song_url = res['artists'][0]['name'] + ' ' + res['name'] 
-
-                    elif 'album' in parts:
-                        res = await self.spotify.get_album(parts[-1])
-                        await self._do_playlist_checks(permissions, player, author, res['tracks']['items'])
-                        procmesg = await self.safe_send_message(channel, self.str.get('cmd-play-spotify-album-process', 'Processing album `{0}` (`{1}`)').format(res['name'], song_url))
-                        for i in res['tracks']['items']:
-                            song_url = i['name'] + ' ' + i['artists'][0]['name']
-                            log.debug('Processing {0}'.format(song_url))
-                            await self.cmd_play(message, player, channel, author, permissions, leftover_args, song_url)
-                        await self.safe_delete_message(procmesg)
-                        return Response(self.str.get('cmd-play-spotify-album-queued', "Enqueued `{0}` with **{1}** songs.").format(res['name'], len(res['tracks']['items'])))
-                    
-                    elif 'playlist' in parts:
-                        res = []
-                        r = await self.spotify.get_playlist_tracks(parts[-1])
-                        while True:
-                            res.extend(r['items'])
-                            if r['next'] is not None:
-                                r = await self.spotify.make_spotify_req(r['next'])
-                                continue
-                            else:
-                                break
-                        await self._do_playlist_checks(permissions, player, author, res)
-                        procmesg = await self.safe_send_message(channel, self.str.get('cmd-play-spotify-playlist-process', 'Processing playlist `{0}` (`{1}`)').format(parts[-1], song_url))
-                        for i in res:
-                            song_url = i['track']['name'] + ' ' + i['track']['artists'][0]['name']
-                            log.debug('Processing {0}'.format(song_url))
-                            await self.cmd_play(message, player, channel, author, permissions, leftover_args, song_url)
-                        await self.safe_delete_message(procmesg)
-                        return Response(self.str.get('cmd-play-spotify-playlist-queued', "Enqueued `{0}` with **{1}** songs.").format(parts[-1], len(res)))
-                    
-                    else:
-                        raise exceptions.CommandError(self.str.get('cmd-play-spotify-unsupported', 'That is not a supported Spotify URI.'), expire_in=30)
-                except exceptions.SpotifyError:
-                    raise exceptions.CommandError(self.str.get('cmd-play-spotify-invalid', 'You either provided an invalid URI, or there was a problem.'))
-
-        # This lock prevent spamming play command to add entries that exceeds time limit/ maximum song limit
-        async with self.aiolocks[_func_() + ':' + str(author.id)]:
-            if permissions.max_songs and player.playlist.count_for_user(author) >= permissions.max_songs:
-                raise exceptions.PermissionsError(
-                    self.str.get('cmd-play-limit', "You have reached your enqueued song limit ({0})").format(permissions.max_songs), expire_in=30
-                )
-
-            if player.karaoke_mode and not permissions.bypass_karaoke_mode:
-                raise exceptions.PermissionsError(
-                    self.str.get('karaoke-enabled', "Karaoke mode is enabled, please try again when its disabled!"), expire_in=30
-                )
-
-            # Try to determine entry type, if _type is playlist then there should be entries
-            while True:
-                try:
-                    info = await self.downloader.extract_info(player.playlist.loop, song_url, download=False, process=False)
-                    # If there is an exception arise when processing we go on and let extract_info down the line report it
-                    # because info might be a playlist and thing that's broke it might be individual entry
+            if self.config._spotify:
+                if 'open.spotify.com' in song_url:
+                    song_url = 'spotify:' + re.sub('(http[s]?:\/\/)?(open.spotify.com)\/', '', song_url).replace('/', ':')
+                    # remove session id (and other query stuff)
+                    song_url = re.sub('\?.*', '', song_url)
+                if song_url.startswith('spotify:'):
+                    parts = song_url.split(":")
                     try:
-                        info_process = await self.downloader.extract_info(player.playlist.loop, song_url, download=False)
-                    except:
-                        info_process = None
+                        if 'track' in parts:
+                            res = await self.spotify.get_track(parts[-1])
+                            song_url = res['artists'][0]['name'] + ' ' + res['name'] 
 
-                    log.debug(info)
+                        elif 'album' in parts:
+                            res = await self.spotify.get_album(parts[-1])
+                            await self._do_playlist_checks(permissions, player, author, res['tracks']['items'])
+                            procmesg = await self.safe_send_message(channel, self.str.get('cmd-play-spotify-album-process', 'Processing album `{0}` (`{1}`)').format(res['name'], song_url))
+                            for i in res['tracks']['items']:
+                                song_url = i['name'] + ' ' + i['artists'][0]['name']
+                                log.debug('Processing {0}'.format(song_url))
+                                await self.cmd_play(message, player, channel, author, permissions, leftover_args, song_url)
+                            await self.safe_delete_message(procmesg)
+                            return Response(self.str.get('cmd-play-spotify-album-queued', "Enqueued `{0}` with **{1}** songs.").format(res['name'], len(res['tracks']['items'])))
+                        
+                        elif 'playlist' in parts:
+                            res = []
+                            r = await self.spotify.get_playlist_tracks(parts[-1])
+                            while True:
+                                res.extend(r['items'])
+                                if r['next'] is not None:
+                                    r = await self.spotify.make_spotify_req(r['next'])
+                                    continue
+                                else:
+                                    break
+                            await self._do_playlist_checks(permissions, player, author, res)
+                            procmesg = await self.safe_send_message(channel, self.str.get('cmd-play-spotify-playlist-process', 'Processing playlist `{0}` (`{1}`)').format(parts[-1], song_url))
+                            for i in res:
+                                song_url = i['track']['name'] + ' ' + i['track']['artists'][0]['name']
+                                log.debug('Processing {0}'.format(song_url))
+                                await self.cmd_play(message, player, channel, author, permissions, leftover_args, song_url)
+                            await self.safe_delete_message(procmesg)
+                            return Response(self.str.get('cmd-play-spotify-playlist-queued', "Enqueued `{0}` with **{1}** songs.").format(parts[-1], len(res)))
+                        
+                        else:
+                            raise exceptions.CommandError(self.str.get('cmd-play-spotify-unsupported', 'That is not a supported Spotify URI.'), expire_in=30)
+                    except exceptions.SpotifyError:
+                        raise exceptions.CommandError(self.str.get('cmd-play-spotify-invalid', 'You either provided an invalid URI, or there was a problem.'))
 
-                    if info_process and info and info_process.get('_type', None) == 'playlist' and 'entries' not in info and not info.get('url', '').startswith('ytsearch'):
-                        use_url = info_process.get('webpage_url', None) or info_process.get('url', None)
-                        if use_url == song_url:
-                            log.warning("Determined incorrect entry type, but suggested url is the same.  Help.")
-                            break # If we break here it will break things down the line and give "This is a playlist" exception as a result
+            # This lock prevent spamming play command to add entries that exceeds time limit/ maximum song limit
+            async with self.aiolocks[_func_() + ':' + str(author.id)]:
+                if permissions.max_songs and player.playlist.count_for_user(author) >= permissions.max_songs:
+                    raise exceptions.PermissionsError(
+                        self.str.get('cmd-play-limit', "You have reached your enqueued song limit ({0})").format(permissions.max_songs), expire_in=30
+                    )
 
-                        log.debug("Assumed url \"%s\" was a single entry, was actually a playlist" % song_url)
-                        log.debug("Using \"%s\" instead" % use_url)
-                        song_url = use_url
-                    else:
-                        break
+                if player.karaoke_mode and not permissions.bypass_karaoke_mode:
+                    raise exceptions.PermissionsError(
+                        self.str.get('karaoke-enabled', "Karaoke mode is enabled, please try again when its disabled!"), expire_in=30
+                    )
 
-                except Exception as e:
-                    if 'unknown url type' in str(e):
-                        song_url = song_url.replace(':', '')  # it's probably not actually an extractor
+                # Try to determine entry type, if _type is playlist then there should be entries
+                while True:
+                    try:
                         info = await self.downloader.extract_info(player.playlist.loop, song_url, download=False, process=False)
-                    else:
-                        raise exceptions.CommandError(e, expire_in=30)
+                        # If there is an exception arise when processing we go on and let extract_info down the line report it
+                        # because info might be a playlist and thing that's broke it might be individual entry
+                        try:
+                            info_process = await self.downloader.extract_info(player.playlist.loop, song_url, download=False)
+                        except:
+                            info_process = None
 
-            if not info:
-                raise exceptions.CommandError(
-                    self.str.get('cmd-play-noinfo', "That video cannot be played. Try using the {0}stream command.").format(self.config.command_prefix),
-                    expire_in=30
-                )
+                        log.debug(info)
 
-            if info.get('extractor', '') not in permissions.extractors and permissions.extractors:
-                raise exceptions.PermissionsError(
-                    self.str.get('cmd-play-badextractor', "You do not have permission to play media from this service."), expire_in=30
-                )
+                        if info_process and info and info_process.get('_type', None) == 'playlist' and 'entries' not in info and not info.get('url', '').startswith('ytsearch'):
+                            use_url = info_process.get('webpage_url', None) or info_process.get('url', None)
+                            if use_url == song_url:
+                                log.warning("Determined incorrect entry type, but suggested url is the same.  Help.")
+                                break # If we break here it will break things down the line and give "This is a playlist" exception as a result
 
-            # abstract the search handling away from the user
-            # our ytdl options allow us to use search strings as input urls
-            if info.get('url', '').startswith('ytsearch'):
-                # print("[Command:play] Searching for \"%s\"" % song_url)
-                info = await self.downloader.extract_info(
-                    player.playlist.loop,
-                    song_url,
-                    download=False,
-                    process=True,    # ASYNC LAMBDAS WHEN
-                    on_error=lambda e: asyncio.ensure_future(
-                        self.safe_send_message(channel, "```\n%s\n```" % e, expire_in=120), loop=self.loop),
-                    retry_on_error=True
-                )
+                            log.debug("Assumed url \"%s\" was a single entry, was actually a playlist" % song_url)
+                            log.debug("Using \"%s\" instead" % use_url)
+                            song_url = use_url
+                        else:
+                            break
+
+                    except Exception as e:
+                        if 'unknown url type' in str(e):
+                            song_url = song_url.replace(':', '')  # it's probably not actually an extractor
+                            info = await self.downloader.extract_info(player.playlist.loop, song_url, download=False, process=False)
+                        else:
+                            raise exceptions.CommandError(e, expire_in=30)
 
                 if not info:
                     raise exceptions.CommandError(
-                        self.str.get('cmd-play-nodata', "Error extracting info from search string, youtubedl returned no data. "
-                                                        "You may need to restart the bot if this continues to happen."), expire_in=30
-                    )
-
-                if not all(info.get('entries', [])):
-                    # empty list, no data
-                    log.debug("Got empty list, no data")
-                    return
-
-                # TODO: handle 'webpage_url' being 'ytsearch:...' or extractor type
-                song_url = info['entries'][0]['webpage_url']
-                info = await self.downloader.extract_info(player.playlist.loop, song_url, download=False, process=False)
-                # Now I could just do: return await self.cmd_play(player, channel, author, song_url)
-                # But this is probably fine
-
-            # If it's playlist
-            if 'entries' in info:
-                await self._do_playlist_checks(permissions, player, author, info['entries'])
-
-                num_songs = sum(1 for _ in info['entries'])
-
-                if info['extractor'].lower() in ['youtube:playlist', 'soundcloud:set', 'bandcamp:album']:
-                    try:
-                        return await self._cmd_play_playlist_async(player, channel, author, permissions, song_url, info['extractor'])
-                    except exceptions.CommandError:
-                        raise
-                    except Exception as e:
-                        log.error("Error queuing playlist", exc_info=True)
-                        raise exceptions.CommandError(self.str.get('cmd-play-playlist-error', "Error queuing playlist:\n`{0}`").format(e), expire_in=30)
-
-                t0 = time.time()
-
-                # My test was 1.2 seconds per song, but we maybe should fudge it a bit, unless we can
-                # monitor it and edit the message with the estimated time, but that's some ADVANCED SHIT
-                # I don't think we can hook into it anyways, so this will have to do.
-                # It would probably be a thread to check a few playlists and get the speed from that
-                # Different playlists might download at different speeds though
-                wait_per_song = 1.2
-
-                procmesg = await self.safe_send_message(
-                    channel,
-                    self.str.get('cmd-play-playlist-gathering-1', 'Gathering playlist information for {0} songs{1}').format(
-                        num_songs,
-                        self.str.get('cmd-play-playlist-gathering-2', ', ETA: {0} seconds').format(fixg(
-                            num_songs * wait_per_song)) if num_songs >= 10 else '.'))
-
-                # We don't have a pretty way of doing this yet.  We need either a loop
-                # that sends these every 10 seconds or a nice context manager.
-                await self.send_typing(channel)
-
-                # TODO: I can create an event emitter object instead, add event functions, and every play list might be asyncified
-                #       Also have a "verify_entry" hook with the entry as an arg and returns the entry if its ok
-
-                entry_list, position = await player.playlist.import_from(song_url, channel=channel, author=author)
-
-                tnow = time.time()
-                ttime = tnow - t0
-                listlen = len(entry_list)
-                drop_count = 0
-
-                if permissions.max_song_length:
-                    for e in entry_list.copy():
-                        if e.duration > permissions.max_song_length:
-                            player.playlist.entries.remove(e)
-                            entry_list.remove(e)
-                            drop_count += 1
-                            # Im pretty sure there's no situation where this would ever break
-                            # Unless the first entry starts being played, which would make this a race condition
-                    if drop_count:
-                        print("Dropped %s songs" % drop_count)
-
-                log.info("Processed {} songs in {} seconds at {:.2f}s/song, {:+.2g}/song from expected ({}s)".format(
-                    listlen,
-                    fixg(ttime),
-                    ttime / listlen if listlen else 0,
-                    ttime / listlen - wait_per_song if listlen - wait_per_song else 0,
-                    fixg(wait_per_song * num_songs))
-                )
-
-                await self.safe_delete_message(procmesg)
-
-                if not listlen - drop_count:
-                    raise exceptions.CommandError(
-                        self.str.get('cmd-play-playlist-maxduration', "No songs were added, all songs were over max duration (%ss)") % permissions.max_song_length,
+                        self.str.get('cmd-play-noinfo', "That video cannot be played. Try using the {0}stream command.").format(self.config.command_prefix),
                         expire_in=30
                     )
 
-                reply_text = self.str.get('cmd-play-playlist-reply', "Enqueued **%s** songs to be played. Position in queue: %s")
-                btext = str(listlen - drop_count)
-
-            # If it's an entry
-            else:
-                # youtube:playlist extractor but it's actually an entry
-                if info.get('extractor', '').startswith('youtube:playlist'):
-                    try:
-                        info = await self.downloader.extract_info(player.playlist.loop, 'https://www.youtube.com/watch?v=%s' % info.get('url', ''), download=False, process=False)
-                    except Exception as e:
-                        raise exceptions.CommandError(e, expire_in=30)
-
-                if permissions.max_song_length and info.get('duration', 0) > permissions.max_song_length:
+                if info.get('extractor', '') not in permissions.extractors and permissions.extractors:
                     raise exceptions.PermissionsError(
-                        self.str.get('cmd-play-song-limit', "Song duration exceeds limit ({0} > {1})").format(info['duration'], permissions.max_song_length),
-                        expire_in=30
+                        self.str.get('cmd-play-badextractor', "You do not have permission to play media from this service."), expire_in=30
                     )
 
-                entry, position = await player.playlist.add_entry(song_url, channel=channel, author=author)
+                # abstract the search handling away from the user
+                # our ytdl options allow us to use search strings as input urls
+                if info.get('url', '').startswith('ytsearch'):
+                    # print("[Command:play] Searching for \"%s\"" % song_url)
+                    info = await self.downloader.extract_info(
+                        player.playlist.loop,
+                        song_url,
+                        download=False,
+                        process=True,    # ASYNC LAMBDAS WHEN
+                        on_error=lambda e: asyncio.ensure_future(
+                            self.safe_send_message(channel, "```\n%s\n```" % e, expire_in=120), loop=self.loop),
+                        retry_on_error=True
+                    )
 
-                reply_text = self.str.get('cmd-play-song-reply', "Enqueued `%s` to be played. Position in queue: %s")
-                btext = entry.title
+                    if not info:
+                        raise exceptions.CommandError(
+                            self.str.get('cmd-play-nodata', "Error extracting info from search string, youtubedl returned no data. "
+                                                            "You may need to restart the bot if this continues to happen."), expire_in=30
+                        )
 
-            if position == 1 and player.is_stopped:
-                position = self.str.get('cmd-play-next', 'Up next!')
-                reply_text %= (btext, position)
+                    if not all(info.get('entries', [])):
+                        # empty list, no data
+                        log.debug("Got empty list, no data")
+                        return
 
-            else:
-                try:
-                    time_until = await player.playlist.estimate_time_until(position, player)
-                    reply_text += self.str.get('cmd-play-eta', ' - estimated time until playing: %s')
-                except:
-                    traceback.print_exc()
-                    time_until = ''
+                    # TODO: handle 'webpage_url' being 'ytsearch:...' or extractor type
+                    song_url = info['entries'][0]['webpage_url']
+                    info = await self.downloader.extract_info(player.playlist.loop, song_url, download=False, process=False)
+                    # Now I could just do: return await self.cmd_play(player, channel, author, song_url)
+                    # But this is probably fine
 
-                reply_text %= (btext, position, ftimedelta(time_until))
+                # If it's playlist
+                if 'entries' in info:
+                    await self._do_playlist_checks(permissions, player, author, info['entries'])
 
-        return Response(reply_text, delete_after=30)
+                    num_songs = sum(1 for _ in info['entries'])
+
+                    if info['extractor'].lower() in ['youtube:playlist', 'soundcloud:set', 'bandcamp:album']:
+                        try:
+                            return await self._cmd_play_playlist_async(player, channel, author, permissions, song_url, info['extractor'])
+                        except exceptions.CommandError:
+                            raise
+                        except Exception as e:
+                            log.error("Error queuing playlist", exc_info=True)
+                            raise exceptions.CommandError(self.str.get('cmd-play-playlist-error', "Error queuing playlist:\n`{0}`").format(e), expire_in=30)
+
+                    t0 = time.time()
+
+                    # My test was 1.2 seconds per song, but we maybe should fudge it a bit, unless we can
+                    # monitor it and edit the message with the estimated time, but that's some ADVANCED SHIT
+                    # I don't think we can hook into it anyways, so this will have to do.
+                    # It would probably be a thread to check a few playlists and get the speed from that
+                    # Different playlists might download at different speeds though
+                    wait_per_song = 1.2
+
+                    procmesg = await self.safe_send_message(
+                        channel,
+                        self.str.get('cmd-play-playlist-gathering-1', 'Gathering playlist information for {0} songs{1}').format(
+                            num_songs,
+                            self.str.get('cmd-play-playlist-gathering-2', ', ETA: {0} seconds').format(fixg(
+                                num_songs * wait_per_song)) if num_songs >= 10 else '.'))
+
+                    # We don't have a pretty way of doing this yet.  We need either a loop
+                    # that sends these every 10 seconds or a nice context manager.
+                    await self.send_typing(channel)
+
+                    # TODO: I can create an event emitter object instead, add event functions, and every play list might be asyncified
+                    #       Also have a "verify_entry" hook with the entry as an arg and returns the entry if its ok
+
+                    entry_list, position = await player.playlist.import_from(song_url, channel=channel, author=author)
+
+                    tnow = time.time()
+                    ttime = tnow - t0
+                    listlen = len(entry_list)
+                    drop_count = 0
+
+                    if permissions.max_song_length:
+                        for e in entry_list.copy():
+                            if e.duration > permissions.max_song_length:
+                                player.playlist.entries.remove(e)
+                                entry_list.remove(e)
+                                drop_count += 1
+                                # Im pretty sure there's no situation where this would ever break
+                                # Unless the first entry starts being played, which would make this a race condition
+                        if drop_count:
+                            print("Dropped %s songs" % drop_count)
+
+                    log.info("Processed {} songs in {} seconds at {:.2f}s/song, {:+.2g}/song from expected ({}s)".format(
+                        listlen,
+                        fixg(ttime),
+                        ttime / listlen if listlen else 0,
+                        ttime / listlen - wait_per_song if listlen - wait_per_song else 0,
+                        fixg(wait_per_song * num_songs))
+                    )
+
+                    await self.safe_delete_message(procmesg)
+
+                    if not listlen - drop_count:
+                        raise exceptions.CommandError(
+                            self.str.get('cmd-play-playlist-maxduration', "No songs were added, all songs were over max duration (%ss)") % permissions.max_song_length,
+                            expire_in=30
+                        )
+
+                    reply_text = self.str.get('cmd-play-playlist-reply', "Enqueued **%s** songs to be played. Position in queue: %s")
+                    btext = str(listlen - drop_count)
+
+                # If it's an entry
+                else:
+                    # youtube:playlist extractor but it's actually an entry
+                    if info.get('extractor', '').startswith('youtube:playlist'):
+                        try:
+                            info = await self.downloader.extract_info(player.playlist.loop, 'https://www.youtube.com/watch?v=%s' % info.get('url', ''), download=False, process=False)
+                        except Exception as e:
+                            raise exceptions.CommandError(e, expire_in=30)
+
+                    if permissions.max_song_length and info.get('duration', 0) > permissions.max_song_length:
+                        raise exceptions.PermissionsError(
+                            self.str.get('cmd-play-song-limit', "Song duration exceeds limit ({0} > {1})").format(info['duration'], permissions.max_song_length),
+                            expire_in=30
+                        )
+
+                    entry, position = await player.playlist.add_entry(song_url, channel=channel, author=author)
+
+                    reply_text = self.str.get('cmd-play-song-reply', "Enqueued `%s` to be played. Position in queue: %s")
+                    btext = entry.title
+
+                if position == 1 and player.is_stopped:
+                    position = self.str.get('cmd-play-next', 'Up next!')
+                    reply_text %= (btext, position)
+
+                else:
+                    try:
+                        time_until = await player.playlist.estimate_time_until(position, player)
+                        reply_text += self.str.get('cmd-play-eta', ' - estimated time until playing: %s')
+                    except:
+                        traceback.print_exc()
+                        time_until = ''
+
+                    reply_text %= (btext, position, ftimedelta(time_until))
+
+            return Response(reply_text, delete_after=30)
 
     async def _cmd_play_playlist_async(self, player, channel, author, permissions, playlist_url, extractor_type):
         """
         Secret handler to use the async wizardry to make playlist queuing non-"blocking"
         """
 
-        await self.send_typing(channel)
-        info = await self.downloader.extract_info(player.playlist.loop, playlist_url, download=False, process=False)
+        #await self.send_typing(channel)
+        async with channel.typing(): # 2023-04-22: error handling?
+            info = await self.downloader.extract_info(player.playlist.loop, playlist_url, download=False, process=False)
 
         if not info:
             raise exceptions.CommandError(self.str.get('cmd-play-playlist-invalid', "That playlist cannot be played."))
@@ -1899,18 +1968,23 @@ class MusicBot(discord.Client):
 
         Call the bot to the summoner's voice channel.
         """
-
+        #print("EEEE")
         if not author.voice:
             raise exceptions.CommandError(self.str.get('cmd-summon-novc', 'You are not connected to voice. Try joining a voice channel!'))
 
         voice_client = self.voice_client_in(guild)
-        if voice_client and guild == author.voice.channel.guild:
+        if voice_client and guild == author.voice.channel.guild: #When switching from one channel to another in the same guild
+            #print("CCCC")
             await voice_client.move_to(author.voice.channel)
-        else:
+
+        else:   #When joining a channel after not being in a channel in that guild
+            #print("DDDD")
             # move to _verify_vc_perms?
             chperms = author.voice.channel.permissions_for(guild.me)
+            #print("WWWWW")
 
             if not chperms.connect:
+                #print("DA")
                 log.warning("Cannot join channel '{0}', no permission.".format(author.voice.channel.name))
                 raise exceptions.CommandError(
                     self.str.get('cmd-summon-noperms-connect', "Cannot join channel `{0}`, no permission to connect.").format(author.voice.channel.name),
@@ -1918,22 +1992,24 @@ class MusicBot(discord.Client):
                 )
 
             elif not chperms.speak:
+                #print("DB)")
                 log.warning("Cannot join channel '{0}', no permission to speak.".format(author.voice.channel.name))
                 raise exceptions.CommandError(
                     self.str.get('cmd-summon-noperms-speak', "Cannot join channel `{0}`, no permission to speak.").format(author.voice.channel.name),
                     expire_in=25
                 )
-
+            #print("GGGGG")
             player = await self.get_player(author.voice.channel, create=True, deserialize=self.config.persistent_queue)
-
+            #print("RRRRR")
             if player.is_stopped:
                 player.play()
 
             if self.config.auto_playlist:
                 await self.on_player_finished_playing(player)
 
+        #print("AAA")
         log.info("Joining {0.guild.name}/{0.name}".format(author.voice.channel))
-
+        #print("BBB")
         return Response(self.str.get('cmd-summon-reply', 'Connected to `{0.name}`').format(author.voice.channel))
 
     async def cmd_pause(self, player):
@@ -2303,12 +2379,12 @@ class MusicBot(discord.Client):
         def check(message):
             if is_possible_command_invoke(message) and delete_invokes:
                 return delete_all or message.author == author
-            return message.author == self.user
+            return (message.author == self.user and not message.content.endswith("_ _"))
 
         if self.user.bot:
             if channel.permissions_for(guild.me).manage_messages:
                 deleted = await channel.purge(check=check, limit=search_range, before=message)
-                return Response(self.str.get('cmd-clean-reply', 'Cleaned up {0} message{1}.').format(len(deleted), 's' * bool(deleted)), delete_after=15)
+                return Response(self.str.get('cmd-clean-reply', 'Cleaned up {0} message{1}.').format(len(deleted), 's' * bool(deleted)), delete_after=10)
 
     async def cmd_pldump(self, channel, author, song_url):
         """
@@ -2552,7 +2628,8 @@ class MusicBot(discord.Client):
         await self.disconnect_all_voice_clients()
         raise exceptions.RestartSignal()
 
-    async def cmd_shutdown(self, channel):
+    @dev_only
+    async def cmd_shutdown(self, message, channel):
         """
         Usage:
             {command_prefix}shutdown
@@ -2566,6 +2643,8 @@ class MusicBot(discord.Client):
             player.resume()
         
         await self.disconnect_all_voice_clients()
+        await self.cmd_autosave(None)
+        await message.add_reaction("❤️")
         raise exceptions.TerminateSignal()
 
     async def cmd_leaveserver(self, val, leftover_args):
@@ -2647,20 +2726,706 @@ class MusicBot(discord.Client):
 
         return Response(codeblock.format(result))
 
-    async def on_message(self, message):
-        await self.wait_until_ready()
+    async def user_has_reacted(self, message, reaction_emoji, user_id):
+        """
+        Checks if a message has recieved reaction_emoji from the user specified by user_id.
+        """
+        for reaction in message.reactions:
+            if reaction.emoji == reaction_emoji:
+                async for user in reaction.users():
+                    if user.id == user_id:
+                        return True
+                break
+        return False
 
+    async def on_raw_message_edit(self, payload):
+        """
+        Called whenever a message is edited.
+        The 'raw' means it works regardless of internal message chache, but also that we need to grab the message ourselves.
+        """
+        #Allow typo correction for commands
+        def is_valid_command(content): #Checks if the content represents a valid command
+            content = content.strip().split(" ")[0]
+            if content.startswith(self.config.command_prefix):
+                command = content.replace(self.config.command_prefix, "", 1)
+                if self.config.usealias:
+                    alias = self.aliases.get(command)
+                    command = alias if alias else command
+                cmd = getattr(self, 'cmd_' + command, None)
+                if cmd:
+                    return True
+            return False
+
+        old_message = payload.cached_message
+        if not old_message or (datetime.now(timezone.utc)-old_message.created_at).total_seconds()+14400>60 or old_message.edited_at or is_valid_command(old_message.content):#Check if the old message fits the criteria
+            #print("NOPE")
+            return
+        
+        #fetch the new edited message
+        try:
+            channel = self.get_channel(payload.channel_id)
+            channel = channel if channel else await self.fetch_channel(payload.channel_id)
+            new_message = await channel.fetch_message(payload.message_id)
+        except:
+            print("There was an issue in on_raw_message_edit while fetching the old message stuff")
+            return
+
+        #if new message is a valid command, run it through on_message
+        if is_valid_command(new_message.content):
+            await self.on_message(new_message) #run it through on_message
+        
+
+        
+
+    async def on_raw_reaction_add(self, payload):
+        """
+        Called when a reaction is added to any message. 
+        The 'raw' means it works regardless of internal message cache, but also that we need to grab more data ourselves.
+        Handles all global reaction-related stuff.
+        """
+        #raw_reaction_add only gives us a payload, so we need to do extra work to get the info we need
+        if payload.event_type=="REACTION_REMOVE": #ignore reaction removals (for now at least)
+            return
+        react_guild = self.get_guild(payload.guild_id)
+        #if not react_guild: #This happens when a reaction is added to a DM
+            #return
+
+        react_channel = self.get_channel(payload.channel_id)
+        if not react_channel:
+            try:
+                react_channel = await self.fetch_channel(payload.channel_id)
+            except discord.errors.NotFound: #Something weird has happened
+                print("Couldn't find the reacted channel :(")
+                return
+
+        try:
+            message = await react_channel.fetch_message(payload.message_id) #(there is not method get_message, so an API call is unavoidable afaik)
+        except discord.errors.NotFound: #Message has been removed already
+            print("Couldn't find the reacted message :(")
+            return
+        user = payload.member if payload.member else self.get_user(payload.user_id) #get the user the easy way or the harder way
+        reaction = None
+        for r in message.reactions:
+            if str(r.emoji) == str(payload.emoji):
+                reaction = r
+                break
+
+        if user.bot or user == self.user: #ignore self and other bots
+            return
+
+        #Ignore reminder reactions for users not mentioned in the reaction (does not apply to devs)
+        if message.author==self.user and message.content.startswith("Reminder for") and len(message.embeds)==1 and not (user in message.mentions or str(user.id) in self.config.dev_ids):
+            return
+
+        if reaction.emoji == "🔫" and message.content==("💩") and message.author==self.user and reaction.count<=2 and (await self.user_has_reacted(message, "🔫", self.user.id)): #bnuuy took a massive shit!
+            newscore = self.changeScoreboard(user.id, "pooper_scooper")
+            await message.delete()
+            if newscore == 1:
+                try:
+                    dm_channel = await user.create_dm()
+                    await dm_channel.send("Congrats on cleaning your first poop!\nEvery time you clean up my poop, you get a poop point! Use &poops in the bots channel to view the leaderboard!")
+                except:
+                    pass #don't try too hard
+            return
+        elif reaction.emoji == "🔫": #don't do anything for gun emojis that are not for a valid poop.
+            return
+
+        if reaction.emoji == "💾" and message.author == self.user and reaction.count<=2 and not message.content.endswith("_ _"):
+            embeds = message.embeds
+            content = message.content #.replace("_","\_")#make sure all the underscores stay there
+            if len(embeds)<=0: #no embeds
+                await message.channel.send(content+"_ _")
+            else:
+                await message.channel.send(content+"_ _",embed=embeds[0])
+                embeds.pop(0)
+            for embed in embeds: #just in case there was somehow more than one embed
+               await message.channel.send(content+"_ _",embed=embed)
+
+            await message.delete() #delete the original last to improve responsiveness
+            return
+
+        if reaction.emoji == "❌" and message.author == self.user:
+            await message.delete()
+            return
+
+        if reaction.emoji == "🧹" and str(user.id) in self.config.dev_ids:
+            await message.clear_reactions()
+            return
+
+        if str(reaction.emoji) in "❤️🏳️‍🌈🏴‍☠️🏳️‍⚧️": #copy these reactions always
+            await message.add_reaction(reaction.emoji)
+            return
+
+        if reaction.emoji == "💤" and message.author==self.user and message.content.startswith("Reminder for") and len(message.embeds)==1 and user in message.mentions: #Snooze button for reminders
+            dictionary = message.embeds[0].to_dict()
+            #print(dictionary)
+            remind_message = dictionary["fields"][0]["name"]
+            if remind_message=="_ _":
+                remind_message = dictionary["fields"][0]["value"]
+            self.set_reminder(datetime.now()+timedelta(minutes=9),react_channel.id,user.id,remind_message+" (snoozed)")
+            await message.delete() #prevents spamming of snooze button
+            return
+
+        if reaction.emoji == "📷" and not await self.user_has_reacted(message, "📸", self.user.id):
+            await self.cmd_addquote(message, message.channel, reactedMessage=message)
+            await message.add_reaction("📸")
+            return
+
+        if random.random()<=0.075 and not message.author==self.user: #Sometime copy a reaction
+            if not reaction.emoji in "1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣🔟0️⃣": #exclude some emojis
+                await message.add_reaction(reaction.emoji)
+                return
+        return
+
+    async def on_member_update(self, before, after):
+        oldname = before.name if before.nick==None else before.nick
+        newname = after.name if after.nick==None else after.nick
+
+        #{ig} tag used to prevent an infinite loop, since changing a nickname in here will call the method again.
+        #Not ideal or foolproof, but it's the only way I could come up with.
+
+        try:
+            if oldname.startswith("{ig}"): 
+                return
+            elif newname.startswith("{ig}"):
+                await after.edit(nick=newname.replace("{ig}",""))
+                return
+            elif before.id in self.margaret_ids and oldname != newname and datetime.today().weekday()>4: #Katie cannot change username on weekends
+                await after.edit(nick="{ig}"+oldname)
+        except discord.errors.Forbidden:
+            print("Exception: Could not prevent name change to: "+newname)
+        return
+
+
+    def keymash_test(self,input_text):
+        """
+        Runs two tests to determine how confident the bot is that an input string is keymashing.
+        Outputs a value from 0.0 to 1.0, where 1.0 is 100% confidence the input is keymashing.
+        """
+        characters = "abcdefghijklmnopqrstuvwxyz. "
+        def get_number(text):
+            number = 0
+            for i in range(0,len(text)):
+                number *= len(characters)
+                number += characters.find(text[i])
+            return number
+
+        def chi_squared(o,e):
+            sum = 0
+            for i in range(0,len(o)):
+                sum += ((o[i]-e[i])**2)/max(e[i],0.00001)
+            return sum
+
+        def get_list(text):
+            text = text.lower()
+            list = []
+            singles = len(characters)
+            doubles = len(characters)**2
+            for i in range (0, singles+doubles):
+                list.append(0)
+            length = len(text)
+    
+            for i in range(0,length):
+                f = text[i]
+                s = text[min(i+1,length-1)]
+
+                f = " " if not f in characters else f
+                s = " " if not s in characters else s
+
+                single = get_number(f)
+                double = get_number(f+s)
+                list[single] += 1
+                if i<=length-2:
+                    list[double+singles] += 1
+            for i in range(0,len(list)):
+                list[i] /= length
+            return list
+
+        def test_input(input_list, data_list, text_length):
+            return chi_squared(input_list, data_list)/text_length
+
+        #save memory by re-using the same lists for both tests
+        data_list = []
+        input_list = get_list(input_text)
+
+        with open(os.path.abspath("keymash_data/data_eng.txt"),"r") as f:
+            for line in f.readlines():
+                data_list.append(float(line))
+        eng_score = test_input(input_list, data_list, len(input_text))
+
+        with open(os.path.abspath("keymash_data/data_kma.txt"),"r") as f:
+            lines = f.readlines()
+            for i in range(0,len(lines)):
+                data_list[i]=float(lines[i])
+        kma_score = test_input(input_list, data_list, len(input_text))
+
+        return (eng_score/(eng_score+kma_score))
+
+    def scramble(self, input):
+        """
+        Returns a scrambled version of input.
+        """
+        output = ""
+        while len(output)<=len(input)*0.8:
+            start = random.randint(0,len(input)-1)
+            end = random.randint(start,min(len(input)-1,start+4))
+            output += input[start:end]
+        return output
+
+    def add_typos(self, input):
+        """
+        Inserts realistic typos into an input string. 
+        Does its best not to affect newlines and anything inside curly-braces (i.e. won't break response tags)
+        """
+        keyboard = ["qwertyuiop[","aasdfghjkl;","zzxcvbnm,./"] #approximation of a qwerty-keyboard layout
+        output = ""
+        inkey = False #used to prevent the typos from affecting any keys that may have made it this far
+        for i in range(len(input)):
+            letter = input[i]
+            if letter=="{":
+                inkey=True
+            if len(output)>0 and output[-1]=="}":
+                inkey=False
+            if not letter in "\n" and any(letter in bar for bar in keyboard) and not inkey: #don't fuck with newlines or extra characters or keys
+                while True:
+                    if random.random()>=self.sloppiness_multiplier or self.sloppiness_multiplier>=1: #keep looping until this is true
+                        break
+                    y = 0 if letter in keyboard[0] else (1 if letter in keyboard[1] else 2)
+                    x = keyboard[y].index(letter)
+                    if random.random()<=0.5:
+                        x += random.randint(-1,1)
+                    else:
+                        y += random.randint(-1,1)
+                    y = max(0,min(y,2))
+                    x = max(0,min(x,len(keyboard[y])-1))
+                    letter = keyboard[y][x] if not keyboard[y][x]=="}" else "" #just in case
+            elif not inkey and letter=="!" and random.random()<=self.sloppiness_multiplier:
+                letter="1"
+            elif not inkey and letter==" " and random.random()<=self.sloppiness_multiplier:
+                letter = random.choice(["","  "])
+            output+=letter
+        return output + ("'" if random.random()<=self.sloppiness_multiplier else "") #sometimes add an apostrophe to the end because of a missed return key
+                    
+
+    #parses the trailing and leading phrases from a message around a given keyword. Returns response with the {trail} and {lead} tags filled in
+    def insert_trailing_and_leading(self, message, keyword, response):
+
+        split_characters = ".!?" #characters that mark the edges of the trailing/leading text
+
+        if "{trail}" in response or "{trail1}" in response:
+            trailing = message.split(keyword)[1]
+            for i in range(len(split_characters)):
+                trailing = trailing.split(split_characters[i])[0]
+            if trailing:
+               response = response.replace("{trail}",trailing.strip())
+               response = response.replace("{trail1}", trailing.strip().split(" ")[0])
+
+        if "{lead}" in response or "{lead1}" in response:
+            leading = message.split(keyword)[0]
+            for i in range(len(split_characters)):
+                leading = leading.split(split_characters[i])[-1]
+            if leading:
+                response = response.replace("{lead}",leading.strip())
+                response = response.replace("{lead1}", leading.strip().split(" ")[-1])
+
+        return response
+
+    #tells you if a key in a given message is "alone" (not a part of any other words)
+    def key_is_alone(selfd,message,key):
+        break_characters = ".!?,;:\"'"
+        for i in range(len(break_characters)): #remove common punctuation
+            message = message.replace(break_characters[i]," ")
+            key = key.replace(break_characters[i]," ")
+
+        if len(key.split(" "))==1: #simplest case - key is one word long
+            return (key in message.split(" "))
+        return (message==key or message.startswith(key+" ") or message.endswith(" "+key) or (" "+key+" ") in message) #all the situations I can think of where key is alone
+
+    #converts an input string into a mocking tone by alternating upper and lowercase characters
+    def mocking_tone(self,text):
+        output = ""
+        for i in range(len(text)):
+            if i%2==0:
+                output+=text[i].lower()
+            else:
+                output+=text[i].upper()
+        return output
+
+    #parses out reaction tags (format: "{react}{XXX}") from a response string. Returns a string list. 
+    #The first element is the cleaned response. All consecutive elements are emojis to react with.
+    def get_response_reactions(self, text):
+        remaining_text = text
+        cleaned_response = ""
+        output_list = []
+        reaction_list = []
+        loop_counter = 0
+        while ("{react}" in remaining_text):
+            split_text = remaining_text.split("{react}",1)
+            cleaned_response+=split_text[0]
+            split_text = split_text[1].split("}",1)
+            reaction = split_text[0].replace("{","")
+            reaction = reaction.replace(" ","") #I keep making this mistake, so I'll hardcode in a solution.
+            reaction_list.append(reaction)
+            remaining_text = split_text[1]
+            loop_counter +=1
+            if loop_counter>20:
+                print("INFINITE_LOOP_WARNING!! in get_response_reactions for :"+text)
+                break
+        cleaned_response+=remaining_text
+        output_list.append(cleaned_response)
+        for r in reaction_list:
+            output_list.append(r)
+        return output_list
+
+    #extracts the urls from an input string. there's probably many edge cases that aren't considered here
+    def extract_urls(self, input):
+        split = input.split(" ")
+        urls = []
+        for s in split:
+            if s.startswith("https://") or s.startswith("http://") or s.startswith("www."):
+                urls.append(s)
+        return urls
+
+
+    def portmanteau(self, first, second):
+        """combines two words into one word - written by Katie"""
+
+        leading_vowel = re.compile(r'^[aeiou]', re.IGNORECASE)
+        pattern = re.compile(r'(\w*?)([aeiou]\w*)', re.IGNORECASE)
+        
+        # Error check: The function won't take words that are too short (1 letter).
+        if (len(first) < 2 or len(second) < 2):
+            #print("Arguments not long enough!")
+            return ""
+                               
+        # Error check: The first word can't start with a vowel.
+        if (leading_vowel.match(first)):
+            #print("First word can't start with vowel!")
+            return ""
+                                                  
+        # Error check: Both words must actually have vowels in them for this to actually work.
+        if not (pattern.match(first) and pattern.match(second)):
+            #print("No vowels found!")
+            return ""
+                                                                            
+        port = pattern.match(first).group(1)
+        manteau = pattern.match(second).group(2)
+                                                                                    
+        return (port + manteau)
+        #combines two words into one word
+
+    def portmanteau_old(first, second):
+        """Older version of portmanteau - Ignores the letter Y. Raises exceptions instead of returning empty string"""
+        leading_vowel = re.compile(r'^[aeiou]', re.IGNORECASE)
+        pattern = re.compile(r'(\w+?)([aeiou]\w*)', re.IGNORECASE)
+        if (len(first) < 2 or len(second) < 2):
+            return None
+        if (leading_vowel.match(first)):
+            return None
+        if not (pattern.match(first) and pattern.match(second)):
+            return None
+        port = pattern.match(first).group(1)
+        manteau = pattern.match(second).group(2)
+        return (port + manteau)
+        
+    def portmanthree(self, first, second, third):
+        """Combines two of three words using the portmanteau method - Written by Kate"""
+        options = []
+        words = [first,second,third]
+        try:
+            port12 = self.portmanteau(first,second)
+            if not port12 in words and port12.strip() and not any(((pair.split(";;",1)[0]==words[0].lower() or pair.split(";;",1)[0]=="*") and (pair.split(";;",1)[1]==words[1].lower() or pair.split(";;",1)[1]=="*")) for pair in self.portmanteau_excludes):
+                options.append(port12+" "+third)
+        except (AttributeError,IndexError):
+            print("There was an error in portmanthree on 23 of: "+" ".join(words))
+        
+        try:
+            port23 = self.portmanteau(second,third)
+            if not port23 in words and port23.strip() and not any(((pair.split(";;",1)[0]==words[1].lower() or pair.split(";;",1)[0]=="*") and (pair.split(";;",1)[1]==words[2].lower() or pair.split(";;",1)[1]=="*")) for pair in self.portmanteau_excludes):
+                options.append(first+" "+port23)
+        except (AttributeError,IndexError):
+            print("There was an error in portmanthree on 23 of: "+" ".join(words))
+
+        #These are options I decided to leave out
+        #options.append(portmanteau(first,portmanteau(second,third)))
+        #options.append(portmanteau(portmanteau(first,second),third))
+
+        if len(options)>0:
+            return random.choice(options)
+        return None
+
+
+    async def on_message(self, message):    #The big one. Processes all incoming messages.
+        await self.wait_until_ready()
         message_content = message.content.strip()
-        if not message_content.startswith(self.config.command_prefix):
+        message_content = message_content.replace(self.config.command_prefix+"am i goku", self.config.command_prefix+"goku") #for annie
+
+        reference_dict = self.replies_to_whisper(message) #check if the message is a reply to a whisper. If so, we will skip all the keyword/portmanteau stuff
+
+        if message_content != None and message.author != self.user and not message.content.startswith(self.config.command_prefix) and not message.author.id in self.blacklist and (isinstance(message.channel, discord.abc.PrivateChannel) or not any(gid==message.guild.id for gid in self.unfun_guilds)) and not reference_dict:
+            
+            #portmanteau stuff
+            words = message_content.split()
+            if ((len(words)==2 or len(words)==3) and not message_content.startswith(self.config.command_prefix)):
+                if not any(((pair.split(";;",1)[0]==words[0].lower() or pair.split(";;",1)[0]=="*") and (pair.split(";;",1)[1]==words[1].lower() or pair.split(";;",1)[1]=="*")) for pair in self.portmanteau_excludes) or len(words)==3: #Excludes are applied to portmanthrees in the portmanthree method
+                    try:
+                        if len(words)==2: #portmanteau
+                            combo_word = self.portmanteau(words[0], words[1])
+                            if not (combo_word == words[0] or combo_word == words[1]) and combo_word.strip():
+                                own_message = await message.channel.send(combo_word, delete_after=15)
+                                await own_message.add_reaction("\U0001F4BE")
+
+                        if len(words)==3 and random.random()<0.5: #portmanthree  - only 50% chance so it's less spammy
+                            combo_word = self.portmanthree(words[0], words[1], words[2])
+                            if combo_word:
+                                own_message = await message.channel.send(combo_word, delete_after=10)
+                                await own_message.add_reaction("\U0001F4BE")
+                    except AttributeError:
+                        print("Portmanteau threw an AttributeError for "+message_content)
+                        with open(os.path.abspath("portmanteau_fails.txt"),"a") as f:
+                            f.write("Attribute Error: "+message_content+"\n")
+                    except IndexError:
+                        print("Portmanteau threw an IndexError for "+message_content)
+                        with open(os.path.abspath("portmanteau_fails.txt"),"a") as f:
+                            f.write("Index Error: "+message_content+"\n")
+
+            #keymash recognition stuff
+            if len(message_content)>=11 and not message_content.startswith(self.config.command_prefix) and not message.author==self.user and not "goku" in message_content.lower():
+                keymash_confidence = self.keymash_test(message_content)
+                if keymash_confidence > 0.85:
+                        await message.channel.send(self.scramble(message_content.replace(" ","")),delete_after=20)
+
+            #image reading stuff
+            from_image = False #used for certain response tags
+            if not isinstance(message.channel, discord.abc.PrivateChannel):
+                image_types = ["png","jpeg","gif","jpg"]
+                cached_images = []
+                for attachment in message.attachments:
+                    if any(attachment.filename.lower().endswith(image) for image in image_types):
+                        try:
+                            await attachment.save(os.path.abspath("image_cache/"+attachment.filename))
+                            cached_images.append(os.path.abspath("image_cache/"+attachment.filename))
+                        except:
+                            pass
+
+                if len(cached_images)>0:
+                    hash_code = str(message.id) #prevents race conditions and stuff
+                    with open(os.path.abspath("image_cache/image_list"+hash_code+".txt"),"w") as f:
+                        for path in cached_images:
+                            f.write(path)
+                            f.write("\n")
+                    await self.run_cli("tesseract "+os.path.abspath("image_cache/image_list"+hash_code+".txt")+" "+os.path.abspath("image_cache/out"+hash_code)) #run tesseract
+                    with open(os.path.abspath("image_cache/out"+hash_code+".txt"),"r") as f:
+                        message_content += f.read().strip()
+                        from_image = True
+                    for path in cached_images:
+                        await self.run_cli("rm "+path)
+                    await self.run_cli("rm "+os.path.abspath("image_cache/image_list"+hash_code+".txt"))
+
+            #start_time = time.time()
+
+            #keyword recognition stuff
+            with open(os.path.abspath("responses.txt"),'r') as f: #TODO - make this server-specific and configurable
+                lines = f.readlines()
+
+            with open(os.path.abspath("emotes/default.txt"),'r') as f: #TODO - make this server-specific and configurable
+                lines.extend(f.readlines())
+            try:
+                with open(os.path.abspath("emotes/{}.txt".format(message.channel.guild.id)),'r') as f:
+                    lines.extend(f.readlines())
+            except:
+                pass
+
+            #read_time = round(time.time() - start_time,4)
+            #start_time = time.time()
+
+            #tags to remove from the message, keys, and responses when cleaning
+            cleaning_tags_message = [",","’","'","\""]
+            cleaning_tags_key = ["{noimg}","{deleteorig}","{jeff}","{nodel}","{only}","{a}","{alone}","{gokuattempt}","{fast}","{vfast}","{rare}","{vrare}"]
+            cleaning_tags_response = ["{nodel}","{deleteorig}","{goku}","{fast}","{vfast}","{rare}","{vrare}"]
+
+            contains_only = False
+
+            cleaned_message = message_content.lower().strip()
+            message_words = cleaned_message.split(" ")
+            for tag in cleaning_tags_message:
+                cleaned_message = cleaned_message.replace(tag,"")
+
+            response_cache = []          #contains all responses to be sent
+            delete_flags_cache = []      #contains the time until deletion of the corresponding response (-1 indicated no deletion)
+            #^^(these should be replaced by a single dict list)
+
+            for line in lines:
+
+                if not line.strip() or line.startswith("##"):
+                    continue
+                keys = re.split(r"(?<!\\),",re.split(r"(?<!\\);",line)[0])
+                #keys = line.split(';',1)[0].split(',')
+                for key in keys:
+
+                    key = key.replace("{emote}","{a}{noimg}{nodel}")
+                    cleaned_key = key.lower().strip()
+                    for tag in cleaning_tags_key:
+                        cleaned_key = cleaned_key.replace(tag,"")
+
+                    if cleaned_key in cleaned_message:
+                        if "{alone}" in key and not self.key_is_alone(cleaned_message,cleaned_key): #cleaned_key in cleaned_message.split(" "):
+                            continue
+
+                        if not (from_image and "{noimg}" in key) and (not "{jeff}" in key or message.author.id == 0000000):
+
+                            #witty_response = random.choice(line.split(';')[1].split(','))
+                            witty_response = random.choice(re.split(r"(?<!\\),",re.split(r"(?<!\\);",line)[1])).replace("\\","")
+
+                            #madlib tags
+                            now = datetime.now()
+                            witty_response = witty_response.replace("{author}",message.author.name)
+                            witty_response = witty_response.replace("{atauthor}",message.author.mention)
+                            witty_response = witty_response.replace("{time}",now.strftime("%-I:%M %p"))
+                            witty_response = witty_response.replace("{date}",now.strftime("%B %-d, %Y"))
+                            witty_response = witty_response.replace("{weekday}",now.strftime("%A"))
+
+                            # random tag
+                            witty_response = witty_response.replace("{random}", random.choice(message_words))
+
+                            #boolean-like tags
+                            deleteorig = ("{deleteorig}" in key or "{deleteorig}" in witty_response)
+                            nodel = ("{nodel}" in key or "{nodel}" in witty_response)
+                            fast_delete = ("{fast}" in key or "{fast}" in witty_response)
+                            vfast_delete = ("{vfast}" in key or "{vfast}" in witty_response)
+                            if ("{rare}" in key or "{rare}" in witty_response) and random.random()>=0.5:
+                                continue
+                            if ("{vrare}" in key or "{vrare}" in witty_response) and random.random()>=0.1:
+                                continue
+
+                            if ("{only}" in key or "{only}" in witty_response):
+                                contains_only = True
+                                witty_response = witty_response + "{only}"
+                            if "{a}" in key:
+                                witty_response = witty_response + "{a}"
+
+                            if "{gokuattempt}" in key:
+                                daily_attempts = self.changeScoreboard(message.author.id, "goku_attempts") #TODO - figure out how to resolve this potential race condition
+                                if daily_attempts>self.max_daily_gokus:
+                                    await message.channel.send("YOU HAVE USED UP YOUR DAILY GOKU ATTEMPTS!",delete_after = 60)
+                                    continue
+
+                            if "{goku}" in witty_response:
+                                self.changeScoreboard(message.author.id, "goku")
+
+
+                            for tag in cleaning_tags_response:
+                                witty_response = witty_response.replace(tag,"")
+
+                            try:
+                                witty_response = self.insert_trailing_and_leading(cleaned_message, cleaned_key, witty_response)
+                                if "{trail" in witty_response or "{lead" in witty_response: #ignore response when there is no trail or lead
+                                    continue
+                            except:
+                                #raise
+                                print("There was an issue with leading/trailing parsing")
+                                continue
+
+                            if deleteorig and not message_content.startswith(self.config.command_prefix):
+                                try:
+                                    await message.delete() #might cause issues later on?
+                                except Forbidden:
+                                    print("Tried to delete a message but don't have permission: "+message_content)
+                                    continue
+
+                            reaction_emoji_data = self.get_response_reactions(witty_response)
+                            witty_response = reaction_emoji_data.pop(0) #grab cleaned response - i do it this way just to be confusing
+                            for emoji in reaction_emoji_data:
+                                await message.add_reaction(emoji)
+
+                            #if not witty_response.strip().replace("{break}",""): #there's nothing left after all the tags are gone
+                                #continue
+
+                            response_cache.append(witty_response)
+                            if nodel:
+                                delete_flags_cache.append(-1)
+                            elif vfast_delete:
+                                delete_flags_cache.append(1)
+                            elif fast_delete:
+                                delete_flags_cache.append(5)
+                            else:
+                                delete_flags_cache.append(15)
+
+                            break
+            #parse_time = time.time()-start_time
+            #start_time = time.time()
+
+            #Postprocess response cache
+            response_count = len(response_cache)
+            for i in range(len(response_cache)-1,-1,-1):
+                if contains_only and not "{only}" in response_cache[i] and not "{a}" in response_cache[i]: #there's an {only} tag somewhere, so remove all nonessential responses
+                    response_cache.pop(i)
+                    delete_flags_cache.pop(i)
+                elif not "{a}" in response_cache[i] and not "{only}" in response_cache[i] and (response_count>self.max_responses or random.random()>self.response_frequency): #prune out some nonessential responses
+                    response_cache.pop(i)
+                    delete_flags_cache.pop(i)
+                elif not response_cache[i].replace("{break}","").replace("{a}","").replace("{only}","").replace("💩","").strip(): #remove blank messages (such as reaction-only responses). Also patch for pooper exploit.
+                    response_cache.pop(i)
+                    delete_flags_cache.pop(i)
+                    continue
+                elif not "{a}" in response_cache[i] or "{only}" in response_cache[i]: #message is allowed to be typoed
+                    response_cache[i]=self.add_typos(response_cache[i])
+
+            #Send cached responses
+            response_count = len(response_cache) #update count in case some were removed
+            for i in range(len(response_cache)):
+                response_block = response_cache[i].replace("{a}","").replace("{only}","")
+                delete_time = delete_flags_cache[i]
+                for response in response_block.split("{break}"):
+                    if delete_time < 0:
+                        await message.channel.send(response)
+                    else:
+                        await message.channel.send(response, delete_after=delete_time)
+
+            #send_time = round(time.time()-start_time,4)
+            #print(str(read_time)+"  "+str(parse_time)+"  "+str(send_time)+" : "+str(read_time+parse_time+send_time))
+
+            #Sometimes mock people
+            if response_count==0 and len(message_content)>8 and not "http" in message_content and random.random()<=0.003:
+                await message.channel.send(self.mocking_tone(message_content),delete_after=5)
+
+            #Sometimes react to things
+            if response_count==0 and not "http" in message_content and random.random()<=0.003:
+                random_react = random.choice("👍💀❤️😳☺️😂🤣🙃😎👆😹😏🙌💯")
+                try:
+                    await message.add_reaction(random_react)
+                except:
+                    print("Bad emoji?: "+random_react) #Sometimes this happens. idk why though. One of these is probably bad or something.
+
+            #Sometimes say "your mom" to questions - probability increases when the question ends in "doing?" or "do?" - this doesn't happen often because kids these days don't use punctuation
+            if response_count==0 and ((message_content.endswith("doing?") and random.random()<0.1) or (message_content.endswith("do?") and random.random()<0.05) or (message_content.endswith("?") and random.random()<0.001)):
+                await message.channel.send(random.choice(["your","you're","ur","u're","your","you","ya","your","yo"])+" "+random.choice(["mom","mother","mama","mome","mom","mom"]), delete_after=10)
+
+
+        #fix embed fails (media to cdn)
+        bad_embed_formats = [".mov",".webm"] #mp4s work for some reason now
+        embed_fixed = False
+        urls = self.extract_urls(message_content)
+        urls = list(set(urls)) #remove duplicates
+        for url in urls:
+            if url.startswith("https://media.discordapp.net") and any(url.endswith(form) for form in bad_embed_formats) and not isinstance(message.channel, discord.abc.PrivateChannel):
+                mymessage = await message.channel.send("I fixed your embed for you: "+url.replace("media.discordapp.net","cdn.discordapp.com"))
+                await mymessage.add_reaction("❌")
+                embed_fixed = True
+        if embed_fixed:
+            return
+
+        if not (message_content.startswith(self.config.command_prefix) or isinstance(message.channel, discord.abc.PrivateChannel)):
             return
 
         if message.author == self.user:
-            log.warning("Ignoring command from myself ({})".format(message.content))
+            #log.warning("Ignoring command from myself (or this is just me sliding into your DMs) ({})".format(message.content))
             return
 
-        if message.author.bot and message.author.id not in self.config.bot_exception_ids:
-            log.warning("Ignoring command from other bot ({})".format(message.content))
-            return
+        #actually, allowing other bots to control the bot would be kinda funny (and is necessary for webhook control)
+        #if message.author.bot and not message.author.id not in self.config.bot_exception_ids:
+        #    log.warning("Ignoring command from other bot ({})".format(message.content))
+        #    return
 
         if (not isinstance(message.channel, discord.abc.GuildChannel)) and (not isinstance(message.channel, discord.abc.PrivateChannel)):
             return
@@ -2675,22 +3440,56 @@ class MusicBot(discord.Client):
             args = []
 
         handler = getattr(self, 'cmd_' + command, None)
-        if not handler:
+        if not handler: #(handler or isinstance(message.channel, discord.abc.PrivateChannel)):
             # alias handler
             if self.config.usealias:
                 command = self.aliases.get(command)
                 handler = getattr(self, 'cmd_' + command, None)
-                if not handler:
+                if not handler and not isinstance(message.channel, discord.abc.PrivateChannel): #don't return for private channels - need to accept bnuuy submissions
                     return
             else:
-                return
+                if not isinstance(message.channel, discord.abc.PrivateChannel): #not sure what this does. Hopefully it will never run
+                    return
 
-        if isinstance(message.channel, discord.abc.PrivateChannel):
-            if not (message.author.id == self.config.owner_id and command == 'joinserver'):
-                await self.safe_send_message(message.channel, 'You cannot use this bot in private messages.')
-                return
+        if isinstance(message.channel, discord.abc.PrivateChannel): #In the DMS
+            
+            if not (message.author.id == self.config.owner_id and command == 'joinserver') and not any(command == dmcommand for dmcommand in self.dm_commands):
 
-        if self.config.bound_channels and message.channel.id not in self.config.bound_channels:
+                #If message is response to a whisper, send a reply whisper
+                if reference_dict: #this was from way earlier, rember?
+                    sender = message.author
+                    receiver = self.get_user(reference_dict["sender"])
+                    if not receiver:
+                        receiver = await self.fetch_user(reference_dict["sender"]) #Should never run. If it does, the next line will certainly raise an exception.
+                    try:
+                        await self.send_whisper(sender, receiver, message.content, replyToMessage = await message.channel.fetch_message(message.reference.message_id))
+                        print("[Whisper]Sent Reply Whisper: Sender: "+str(message.author.id)+" Message: "+message.content)
+                        await message.add_reaction("✉️")
+                        await message.add_reaction("✅")
+                    except:
+                        await message.channel.send("Sorry, something went wrong while sending that reply. The text may have been too long.")
+                        raise
+
+                    return
+
+                #if message contains attached videos/images, add them to the betabnuuy list
+                for attachment in message.attachments:
+                    new_url = attachment.url.replace("media.discordapp.net","cdn.discordapp.com")
+                    with open(os.path.abspath("bunny_submissions.txt"),"r") as f:
+                        bnuuy_count = len(f.readlines())
+                    with open(os.path.abspath("bunny_submissions.txt"),"a") as f: #don't question my methods!
+                        f.write("\n")
+                        f.write(new_url+","+message.author.name)
+                    embed = discord.Embed(title="Your submission has been added to the list!",color=discord.Color.from_rgb(255, 191, 0))
+                    embed.set_image(url=new_url)
+                    embed.set_footer(text="Your submission's ID number is "+str(bnuuy_count+1))
+                    await message.channel.send(embed=embed)
+                return
+        
+
+
+
+        if self.config.bound_channels and message.channel.id not in self.config.bound_channels and not isinstance(message.channel, discord.abc.PrivateChannel) and not any(command==anywherecommand for anywherecommand in self.anywhere_commands):
             if self.config.unbound_servers:
                 for channel in message.guild.channels:
                     if channel.id in self.config.bound_channels:
@@ -2712,8 +3511,16 @@ class MusicBot(discord.Client):
 
         sentmsg = response = None
 
+
+
         # noinspection PyBroadException
         try:
+            if command=="play" and message.guild.id not in self.players: #auto-summon feature (it's in here to allow error-catching)
+                print("AUTO SUMMONING")
+                await self.cmd_summon(message.channel, message.guild, message.author,message.guild.me.voice.channel if message.guild.me.voice else None) #kinda hacky, but it works
+
+
+
             if user_permissions.ignore_non_voice and command in user_permissions.ignore_non_voice:
                 await self._check_ignore_non_voice(message)
 
@@ -2821,7 +3628,7 @@ class MusicBot(discord.Client):
 
                 if response.reply:
                     if isinstance(content, discord.Embed):
-                        content.description = '{} {}'.format(message.author.mention, content.description if content.description is not discord.Embed.Empty else '')
+                        content.description = '{} {}'.format(message.author.mention, content.description if content.description is not None else '') # 2023-04-21: discord.Embed.Empty removed for None
                     else:
                         content = '{}: {}'.format(message.author.mention, content)
 
@@ -2867,21 +3674,35 @@ class MusicBot(discord.Client):
     async def gen_cmd_list(self, message, list_all_cmds=False):
         for att in dir(self):
             # This will always return at least cmd_help, since they needed perms to run this command
-            if att.startswith('cmd_') and not hasattr(getattr(self, att), 'dev_cmd'):
+            if att.startswith('cmd_') and (not hasattr(getattr(self, att), 'dev_cmd') or str(message.author.id) in self.config.dev_ids) and (not hasattr(getattr(self, att), 'owner_cmd') or message.author.id==self.config.owner_id):
                 user_permissions = self.permissions.for_user(message.author)
                 command_name = att.replace('cmd_', '').lower()
                 whitelist = user_permissions.command_whitelist
                 blacklist = user_permissions.command_blacklist
-                if list_all_cmds:
-                    self.commands.append('{}{}'.format(self.config.command_prefix, command_name))
 
+                #Add a dagger mark to commands only accessible to devs/owner
+                
+
+                #list all commands (that the user has permissions for)
+                if list_all_cmds:
+                    #if a command is not usually useable in the current channel, add an asterisk to the name
+                    if (isinstance(message.channel,discord.abc.PrivateChannel) and not command_name in self.dm_commands) or (not isinstance(message.channel,discord.abc.PrivateChannel) and command_name not in self.anywhere_commands):
+                        if self.config.bound_channels and message.channel.id not in self.config.bound_channels:
+                            command_name = command_name + "*"
+                    if hasattr(getattr(self, att), 'dev_cmd') or hasattr(getattr(self, att), 'owner_cmd'):
+                        command_name = command_name + "†"
+                    self.commands.append('{}{}'.format(self.config.command_prefix, command_name)) #why does it use an instance variable for this??
+
+                #im not what blacklist and whitelist are, but I'm leaving them in (-Kate)
                 elif blacklist and command_name in blacklist:
                     pass
-
                 elif whitelist and command_name not in whitelist:
                     pass
 
-                else:
+                #only include command if it's useable in the current channel
+                elif (isinstance(message.channel,discord.abc.PrivateChannel) and command_name in self.dm_commands) or (not isinstance(message.channel,discord.abc.PrivateChannel) and command_name in self.anywhere_commands) or (self.config.bound_channels and message.channel.id in self.config.bound_channels):
+                    if hasattr(getattr(self, att), 'dev_cmd') or hasattr(getattr(self, att), 'owner_cmd'):
+                        command_name = command_name + "†"
                     self.commands.append("{}{}".format(self.config.command_prefix, command_name))
 
     async def on_voice_state_update(self, member, before, after):
@@ -3029,3 +3850,3678 @@ class MusicBot(discord.Client):
             if vc.guild == guild:
                 return vc
         return None
+
+    async def cmd_ping(self, channel):
+        """
+        Usage:
+            {command_prefix}ping
+
+        Checks if BnuuyBot is listening to you. Also gives latency.
+        """
+        embed = discord.Embed(title="Pong!",color=discord.Color.from_rgb(3, 252, 53))
+        embed.set_footer(text="Latency: "+str(round(self.latency*100,2))+" ms")
+        await channel.send(embed=embed)
+        return
+
+    async def cmd_bnuuy(self, channel, message):
+        """
+        Usage:
+            {command_prefix}bnuuy
+            {command_prefix}bnuuy [ID number]
+
+        Aliases:
+            {command_prefix}bny
+
+        Provides a random image of a bnuuy from a curated list.
+        """
+        try:
+            number = int(message.content.split(" ")[1])
+        except:
+            number = 0
+        with open(os.path.abspath("bunny_links.txt"),"r") as f:
+            random_url=""
+            lines = f.readlines()
+
+            if number-1 >= len(lines):
+                await channel.send("That ID number was too large")
+                return
+            elif number<0:
+                await channel.send("That ID number was too low")
+                return
+            elif number==0:
+                while not random_url.strip():
+                    line_number = random.randint(0,len(lines)-1)
+                    random_url=lines[line_number]
+            else:
+                line_number = number-1
+                random_url = lines[number-1]
+        embed = discord.Embed(title="Bnuuy",color=discord.Color.from_rgb(181, 255, 181))
+        embed.set_image(url=random_url)
+        embed.set_footer(text="(Bunny number: "+str(line_number+1)+")")
+        await channel.send(embed=embed,delete_after=3600)
+        #await channel.send(random_url, delete_after=120)
+        return
+
+    async def cmd_betabnuuy(self, channel,message):
+        """
+        Usage:
+            {command_prefix}betabnuuy
+            {command_prefix}betabnuuy [ID number]
+
+        Aliases:
+            {command_prefix}bbny
+
+        Provides a random user-provided image that may or may not be a bnuuy. You may submit images to the list by DMing them to BnuuyBot. These images are not necessarily curated. Use at own risk.
+        """
+        try:
+            number = int(message.content.split(" ")[1])
+        except:
+            number = 0
+
+        video_formats = [".mp4",".mov"]
+        with open(os.path.abspath("bunny_submissions.txt"),"r") as f:
+            random_line = ""
+            lines = f.readlines()
+            if number-1 >= len(lines):
+                await channel.send("That ID number was too large")
+                return
+            elif number<0:
+                await channel.send("That ID number was too low")
+                return
+            elif number==0:
+                while not random_line.strip() or random_line.startswith("##"): #TODO - fix infinite loop when there are no betabnuuys available
+                    line_number = random.randint(0,len(lines)-1)
+                    random_line=lines[line_number]
+            else:
+                line_number = number-1
+                random_line = lines[number-1]
+        random_info = random_line.split(",",1)
+        random_url, poster = random_info[0], random_info[1]
+        if any(random_url.endswith(format) for format in video_formats): #Videos don't work in Embeds
+            await channel.send(random_url,delete_after=120)
+            await channel.send("This image was provided by: "+poster+"\nYou can send your own pictures to me through DMs!   (Bunny Number: "+str(line_number+1)+")", delete_after=3600)
+        else:
+            embed = discord.Embed(title="Bnuuy provided by: "+poster,color=discord.Color.from_rgb(255, 199, 234))
+            embed.set_image(url=random_url)
+            embed.set_footer(text="You can add more Bnuuys by DMing me your images!        (Bunny number: "+str(line_number+1)+")")
+            await channel.send(embed=embed,delete_after=3600)
+        return
+
+    @dev_only
+    async def cmd_removebnuuy(self,message,channel):
+        """
+        Usage:
+            {command_prefix}removebnuuy #
+
+        Removes a specified bnuuy from the betabnuuy list, given its number.
+        Note: Doesn't actually delete the line - just comments it out, so the id number of the other bnuuys are not altered
+        """
+        try:
+            number = int(message.content.split(" ",1)[1])
+            
+        except TypeError:
+            await channel.send("That was not a valid betabnuuy number!",delete_after=30)
+            return
+        except IndexError:
+            await channel.send("Please specify the number of the bnuuy to remove",delete_after=30)
+            return
+
+        with open(os.path.abspath("bunny_submissions.txt"),"r") as f:
+            lines = f.readlines()
+
+        if number<0 or number>=len(lines):
+            await channel.send("That number is not valid (too high or too low)",delete_after=30)
+            return
+        if not lines[number].strip() or lines[number].startswith("##"):
+            await channel.send("That bnuuy is either already deleted, or it does not exist",delete_after=30)
+            return
+
+        lines[number] = "##"+lines[number]
+
+        with open(os.path.abspath("bunny_submissions.txt"),"w") as f:
+            f.writelines(lines)
+
+        await message.add_reaction("✅")
+        return
+        
+
+    async def cmd_hug(self, channel):
+        """
+        Usage:
+            {command_prefix}hug
+
+        Sends a virtual hug!
+        """
+        await channel.send("_Hug_")
+        return
+
+    async def cmd_ratbastard(self, channel):
+        """
+        Usage:
+            {command_prefix}ratbastard
+
+        Please, for the love of god, don't use this command.
+        """
+
+        with open(os.path.abspath("misc_data/ratatouille.txt"),"r") as f:
+            lines = f.readlines()
+            lifetime=70
+            for line in lines:
+                await channel.send(line, delete_after=lifetime)
+                lifetime+=70
+        return
+
+    async def cmd_listlens(self, channel):
+        """
+        Usage:
+            {command_prefix}listlens
+
+        Lists the current sizes of the various lists.
+        """
+        key_count = 0
+        answer_count = 0
+        with open(os.path.abspath("bunny_links.txt"),"r") as f:
+            bunnies = len(f.readlines())
+        with open(os.path.abspath("bunny_submissions.txt"),"r") as f:
+            submissions = len(f.readlines())
+        with open(os.path.abspath("responses.txt"),"r") as f: #TODO - count individual keys and responses
+            lines = f.readlines()
+            response_pairs = 0
+            key_count = 0
+            response_count = 0
+            for line in lines:
+                if line.startswith("##") or not line.strip():
+                    continue
+                response_pairs+=1
+                key_count += len(line.split(";")[0].split(","))
+                response_count += len(line.split(";")[1].split(","))
+        with open(os.path.abspath("misc_data/dadjokes.txt"),"r") as f:
+            dadjokes = len(f.readlines())
+        with open(os.path.abspath("misc_data/quotes.txt"),"r") as f:
+            quotes = len(f.readlines())
+        with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+            reminders = len(f.readlines())
+        with open(os.path.abspath("misc_data/whispers.txt"),"r") as f:
+            whispers = len(f.readlines())
+        await channel.send("Regular Bnuuys: "+str(bunnies)+"\nBetaBnuuy Submissions: "+str(submissions)+"\nResponseGroups: "+str(response_pairs)+"   (Keys: "+str(key_count)+" , Responses: "+str(response_count)+")\nQuotes: "+str(quotes)+"\nReminders: "+str(reminders)+"\nWhispers: "+str(whispers)+"\nDadJokes: "+str(dadjokes), delete_after=120)
+        return
+
+
+    async def cmd_bnuuyboard(self,channel):
+        """
+        Usage:
+            {command_prefix}bnuuyboard
+
+        Aliases:
+            {command_prefix}bboard
+
+
+        Gives a list of all the top bnuuy contributors!
+        """
+        names = []
+        counts = []
+        with open(os.path.abspath("bunny_submissions.txt"),"r") as f:
+            lines = f.readlines()
+        for line in lines:
+            if line.startswith("##") or not line.strip():
+                continue
+            sender = line.split(",")[1].replace("\n","").strip()
+
+            match_found = False
+            for i in range(len(names)):
+                if names[i]==sender:
+                    match_found = True
+                    counts[i] = counts[i]+1
+                    break
+            if not match_found:
+                names.append(sender)
+                counts.append(1)
+
+        for i in range(len(names)):
+            names[i] = names[i].replace("\n","")+"     #$#$#"+str(counts[i]) #using a bad delimiter because im too tired to think of a better way
+
+        ordered_names = sorted(names, key=lambda name: int(name.split("#$#$#",1)[1])) #It is what it is
+
+        DISPLAY_COUNT = 7
+        output_string = "TOP BNUUY CONTRIBUTORS!\n"
+        number = 1
+        for i in range(len(ordered_names)-1,max(-1,len(ordered_names)-DISPLAY_COUNT-1),-1):
+            output_string += "\n"+str(number)+".  "+ordered_names[i].replace("#$#$#","") #clean up this stupid mess i've made
+            number +=1
+
+        embed = discord.Embed(color=discord.Color.from_rgb(196, 249, 255))
+        embed.add_field(name = output_string, value = "_ _")
+        embed.set_footer(text="You can contribute more bnuuys by DMing me your own fun images!")
+        await channel.send(embed=embed, delete_after = 30)
+
+
+    async def cmd_minesweeper(self, message, channel): #TODO - make more compact
+        """
+        Usage:
+            {command_prefix}minesweeper [size]
+
+        Aliases:
+            {command_prefix}msw
+
+        Generates a square minesweeper board of a specified size. Size cannot exceed 9 because discord character limit is kinda weird, sorry.
+        """
+        emojis = [":zero:",":one:",":two:",":three:",":four:",":five:",":six:",":seven:",":eight:",":nine:"]
+        bomb = ":bomb:"
+        bomblines = []
+        try:
+            linecount = int(message.content.split(" ")[1])
+        except:
+            await channel.send("Sorry, I couldn't parse that number :/",delete_after=20)
+            return
+        if linecount >30:
+            await channel.send("That number is too high. The limit is 30.",delete_after=15)
+            return
+        if linecount <1:
+            await channel.send("Haha, very funny. But you won't be laughing when I deduct a goku point from you.",delete_after=15)
+            return
+        totalbombs = linecount**2 * 0.2
+        bombs = 0
+        bombprob = (totalbombs-bombs)/(linecount**2)
+
+
+        #bomb-laying pass
+        for i in range(0,linecount):
+            line = ""
+            for j in range(0,linecount):
+                bombprob = (totalbombs-bombs)/(linecount**2-i*linecount-j)
+                if random.random()<bombprob:
+                    line = line+"@"
+                    bombs+=1
+                else:
+                    line = line+"#"
+            bomblines.append(line)
+
+        #counting pass
+        lines = []
+        for i in range(0,linecount):
+            line = ""
+            for j in range(0,linecount):
+                if bomblines[i][j] == "#":
+                    count = 0
+                    if i>0 and j>0 and bomblines[i-1][j-1]=="@":
+                        count+=1
+                    if i>0 and bomblines[i-1][j]=="@":
+                        count+=1
+                    if i>0 and j<linecount-1 and bomblines[i-1][j+1]=="@":
+                        count+=1
+                    if j>0 and bomblines[i][j-1]=="@":
+                        count+=1
+                    if j<linecount-1 and bomblines[i][j+1]=="@":
+                        count+=1
+                    if i<linecount-1 and j>0 and bomblines[i+1][j-1]=="@":
+                        count+=1
+                    if i<linecount-1 and bomblines[i+1][j]=="@":
+                        count+=1
+                    if i<linecount-1 and j<linecount-1 and bomblines[i+1][j+1]=="@":
+                        count+=1
+                    line = line+"||"+emojis[count]+"||"
+                else:
+                    line = line+"||"+bomb+"||"
+            lines.append(line)
+
+        #combine lines into one message and send
+        output_text = ""
+        for line in lines:
+            output_text += line+"\n"
+        
+        output_splits = self.split_long_text(output_text,MAX_LEN = 600)
+        for split in output_splits:
+            await channel.send(split,delete_after=linecount**2*15)
+            if len(output_splits)>5:
+                await asyncio.sleep(0.5)
+        return
+
+    async def cmd_someone(self, message, channel):
+        """
+        Usage:
+            {command_prefix}somebody
+
+        Pings someone. Anyone.
+        """
+        somebody_random = random.choice(message.guild.members)
+        await channel.send(somebody_random.mention)
+        await message.delete()
+
+    @dev_only
+    async def cmd_repeat(self, message, channel):
+        """
+        Usage:
+            {command_prefix}repeat
+
+        Repeats the content of the previous message. Written as a test of the channel.history() funciton.
+        """
+        i = 0
+        #okay, don't judge me, this wasn't working the normal way and I'm too impatient to figure out why 
+        async for elem in channel.history(limit=2):
+            if i==0:
+                i+=1
+                continue
+            await channel.send(elem.content)
+            return
+
+    @dev_only
+    async def cmd_echo(self, message, channel):
+        """
+        Usage:
+            {command_prefix}echo [text]
+            {command_prefix}echo [channel ID] [text]
+
+        Use the bot as a puppet to say whatever you want. Can even send messages to specific channels remotely by specifying the ID.
+        Add emojis reactions to the message using the "react" tag, just as you would in a response.txt entry.
+        """
+
+        try:
+            input_text = message.content.split(" ",1)[1].strip()
+        except IndexError:
+            input_text=""
+
+        reaction_info = self.get_response_reactions(input_text)
+        input_text = reaction_info.pop(0)
+        #input_text = input_text.replace("_","\_")
+
+        if not input_text.strip():
+            input_text = "_ _"
+
+        if not isinstance(channel, discord.abc.PrivateChannel):
+            await message.delete()
+
+        try:
+            idstring = input_text.split(" ",1)[0]
+            if not len(idstring) == 18:
+                raise ValueError
+            channel_id = int(idstring)
+            new_input_text = input_text.split(" ",1)[1]
+            if not new_input_text.strip():
+                raise ValueError
+
+            channel_dest = self.get_channel(channel_id)
+            mymessage = await channel_dest.send(new_input_text+"_ _")
+
+        except (TypeError, ValueError, AttributeError):
+            mymessage = await channel.send(input_text+"_ _")
+
+        for emoji in reaction_info:
+            await mymessage.add_reaction(emoji)
+
+        if isinstance(channel, discord.abc.PrivateChannel):
+            await message.add_reaction("✅")
+
+        return
+
+
+    async def cmd_profile(self, message, channel):
+        """
+        Usage:
+            {command_prefix}profile
+            {command_prefix}profile [user ID]
+            {command_prefix}profile [user ping/mention]
+            {command_prefix}profile [user] [user] [user] [...]
+
+        Aliases:
+            {command_prefix}pro
+            {command_prefix}prof
+            {command_prefix}avatar
+            {command_prefix}ava
+            {command_prefix}av
+
+        Displays information about the user. If no user id is given, it will default to the command sender. Multiple users may be input at once.
+        The displayed information includes avatar, username, discord ID, account creation date, and guild join date (if applicable), blacklist status, and goku status (if applicable).
+        """
+        if "@everyone" in message.content or "@here" in message.content:
+            await channel.send("That doesn't seem like a good idea.",delete_after=40)
+            return
+        
+        search_users = []
+        if len(message.mentions)>0:
+            for m in message.mentions:
+                search_users.append(m)
+        args = message.content.strip().split(" ")
+        args = list(filter(lambda x:x, args))
+        args.pop(0) #will always just be "&profile"
+        for arg in args:
+            if self.is_valid_id(arg):
+                try:
+                    searched_user = self.get_user(arg)
+                    searched_user = searched_user if searched_user else await self.fetch_user(arg)
+                    search_users.append(searched_user)
+                except:
+                    continue
+
+        if len(search_users)==0 and len(args)>0:
+            await channel.send("Sorry, but none of those were valid inputs. Please use the help command if you need more info.",delete_after=40)
+            return
+        elif len(search_users)<len(args):
+            await channel.send("Some of those users were not valid inputs, but here's what I was able to find")
+        elif len(search_users)==0 and len(args)==0:
+            search_users.append(message.author)
+
+        search_users = list(set(search_users)) #remove duplicates
+
+        for user in search_users:
+            member, guild = None, None
+            if not isinstance(channel,discord.abc.PrivateChannel): #channel.guild throws exception in DM channel
+                guild = channel.guild
+                member = guild.get_member(user.id) #might need to add fetch_user if returns None incorrectly
+                #member = guild.fetch_member
+
+            text_title = user.name if not member else member.name +(" AKA "+member.nick if member.nick else "") #the things I do to save a line
+            text_title += " [OWNER]" if user.id == self.config.owner_id else (" [DEV]" if str(user.id) in self.config.dev_ids else (" [JEFF]" if user.id==0000000 else ("[BNUUY]" if user==self.user else ("[BOT]" if user.bot else ""))))
+
+            #add scoreboard leader tags
+            top_gokus = self.getScoreboardTop("goku",guild_id=(None if not guild else guild.id))
+            top_scoopers = self.getScoreboardTop("pooper_scooper",guild_id=(None if not guild else guild.id))
+            top_wordles = self.getScoreboardTop("wordle_wins",guild_id=(None if not guild else guild.id))
+            text_title += " [GOKU]" if any(user.id==u.id for u in top_gokus) else ""
+            text_title += " [💩]" if any(user.id==u.id for u in top_scoopers) else ""
+            text_title += " [🟩]" if any(user.id==u.id for u in top_wordles) else ""
+
+            embed = discord.Embed(title = text_title, color=user.color)
+            embed.set_image(url = user.avatar_url)
+            if user.id in self.blacklist:
+                embed.add_field(name="Blacklisted!",value="_ _",inline=False)
+            embed.add_field(name="User ID:",value=str(user.id),inline=False)
+            embed.add_field(name="Account created on:",value = user.created_at.strftime("%B %-d, %Y, at %-I:%m:%S %p"), inline=False)
+            if member:
+                embed.add_field(name="Server joined on:",value = member.joined_at.strftime("%B %-d, %Y, at %-I:%m:%S %p"), inline=False)
+                embed.add_field(name="Goku status:",value = "Points: "+str(self.getScoreboard(member.id, "goku"))+"\nToday's Attempts: "+str(self.getScoreboard(member.id, "goku_attempts")), inline=True)
+                embed.add_field(name="Poops Scooped:",value = str(self.getScoreboard(member.id, "pooper_scooper")), inline=True)
+            #embed.add_field(name="Blacklisted?",value = "Yes" if user.id in self.blacklist else "No", inline=True)
+            embed.set_footer(text="User ID again: "+str(user.id))
+            await channel.send(embed=embed,delete_after=180)
+
+        return
+
+
+
+    @dev_only
+    async def cmd_kmaconf(self, message, channel):
+        """
+        Usage:
+            {command_prefix}kmaconf
+
+        Checks the previous message and gives you the confidence that it is keymashing. Used for debugging.
+        """
+        await message.delete()
+        test_text = ""
+        async for elem in channel.history(limit=1):
+            test_text = elem.content
+            break
+        if not test_text.strip():
+            await channel.send("Sorry, no text was found",delete_after=15)
+            return
+
+        start_time = time.time()
+        score = self.keymash_test(test_text)
+        end_time = time.time()
+        await channel.send("KmaConfidence: "+str(round(score*100,2))+"%, Time: "+str(round(end_time-start_time,3))+" seconds")
+        return
+
+    async def cmd_starwars(self, message, channel):
+        """
+        Usage:
+            {command_prefix}starwars
+
+        Plays starwars ASCII. Don't ever use this command. (Can be cancelled by reacting with the "X" emoji)
+        """
+        lines_per_frame = 14
+        delay = 120
+
+        frame_message = await channel.send("Loading...")
+
+        with open(os.path.abspath("misc_data/starwars.txt"),"r") as f:
+            lines = f.readlines()
+
+        for i in range(0,len(lines),lines_per_frame):
+            next_frame = ""
+            for j in range(1,lines_per_frame):
+                next_frame += lines.pop(1)+"\n"
+            try:
+                await frame_message.edit(content=next_frame.replace("_","\_"))
+                await asyncio.sleep(int(lines.pop(0))*delay*0.001)
+            except discord.errors.HTTPException:
+                await frame_message.edit(content="_ _")
+                await asyncio.sleep(int(lines.pop(0))*delay*0.001)
+            except discord.errors.NotFound:
+                return
+        await frame_message.edit(content="The End!")
+        return
+
+    #Parses the data for a given roll command into a list of integers. If a given value is unspecified, default values are used.
+    #The order and default values are teh following:
+    #[rolls=1, sides=6, delete_lowest=0, keep_lowest=0, delete_highest=0, keep_highest=0, add_modifier=0, multiply_modifier=1, quantum_roll=0]
+    #raises ValueError when something is invalid
+    #TODO - return a dictionary instead of a list to make it easier to decypher
+    #TODO - make the token parsing actually decent
+    def parse_roll(self, input):
+        tokens=[]
+        values=[]
+        #remove any q's that represent a quantum roll
+        quant=False
+        if "q" in input:
+            input=input.replace("q","",1)
+            quant=True
+
+        #number of rolls - outlier because it goes first and has no leading string
+        if input[0].isdigit():
+            i = 0
+            while i<len(input) and input[i].isdigit():
+                i+=1
+            tokens.append("r") #placeholder token for first number
+            values.append(int(input[0:i]))
+            input = input[i:]
+
+        while len(input)>0:
+            #get leading string:
+            i = 0
+            while not input[i].isdigit():
+                i+=1
+            tokens.append(input[0:i])
+            input=input[i:]
+            #get following number
+            i=0
+            while i<len(input) and input[i].isdigit():
+                i+=1
+            values.append(int(input[0:i]))
+            input=input[i:]
+
+        if len(values) != len(list(set(tokens))): #a token was used more than once, or something else went wrong.
+            raise IndexError
+
+        #sort out the tokens and values
+        output = [1,6,0,0,0,0,0,1,(1 if quant else 0)]
+        for i in range(len(tokens)):
+            if tokens[i]=="r":
+                output[0]=values[i]
+            elif tokens[i]=="d":
+                output[1]=values[i]
+            elif tokens[i]=="dl":
+                output[2]=values[i]
+            elif tokens[i]=="kl":
+                output[3]=values[i]
+            elif tokens[i]=="dh":
+                output[4]=values[i]
+            elif tokens[i]=="kh":
+                output[5]=values[i]
+            elif tokens[i]=="+":
+                output[6]+=values[i]
+            elif tokens[i]=="-":
+                output[6]-=values[i]
+            elif tokens[i]=="*":
+                output[7]*=values[i]
+            elif tokens[i]=="/":
+                output[7]/=values[i]
+            else:
+                print("BAD TOKEN: "+tokens[i])
+                raise IndexError
+        return output
+
+    #I was having difficulties with list.copy(), so I just did it myself. Clones the contents of a 1D list (probably) into a new list.
+    def myclone1d(self, list):
+        newlist = []
+        for i in range(len(list)):
+            newlist.append(0)
+            newlist[i] = list[i]
+        return newlist
+
+    #gets a list of [count] lowest values in the input list
+    def minimums(self, input, count):
+        minis = []
+        if count==0:
+            return minis
+        input = self.myclone1d(input) #prevent this method from modifying the list, probably
+        for i in range(count):
+            mini = min(input)
+            minis.append(mini)
+            input.remove(mini)
+        return minis
+
+    #gets a list of [count] largest values in the input list
+    def maximums(self, input, count):
+        maxis = []
+        if count==0:
+            return maxis
+        input = self.myclone1d(input) #prevent this method from modifying the list, probably
+        for i in range(count):
+            maxi = max(input)
+            maxis.append(maxi)
+            input.remove(maxi)
+        return maxis
+
+    async def cmd_roll(self, message, channel):
+        """
+        Usage:
+            {command_prefix}roll #
+            {command_prefix}roll d#
+            {command_prefix}roll #d#
+            {command_prefix}roll #d#[other tokens w/ numbers (see below)]
+            {command_prefix}roll [roll1] [roll2] [...]
+
+        Aliases:
+            {command_prefix}r
+
+        Rolls a d# die a specified number of times and gives the total.
+        Defaults to one roll when the roll count is not specified. Defaults to a d6 when the die number is not specified.
+        Multiple dice rolls can be done in a single command by putting spaces between them.
+        You may specify additional operations using tokens and numbers. Every token must be followed by a number!
+        You can even split the multiverse by using a quantum random number as the rng seed with the q token! (learn more at qrng.anu.edu.au)
+        ===Supported Tokens:===
+            dl -> deletes lowest rolls
+            kl -> keep only lowest rolls
+            dh -> deletes highest rolls
+            kh -> keep only highest rolls
+            (* or /) -> scales the sum by a constant
+            (+ or -) -> offsets the sum by a constant (performed after scaling)
+            q -> Can go anywhere in the input. Seeds the rolls with a quantum random number (may run slower)
+        Examples:
+            {command_prefix}roll 3d10kh2 -> rolls 3 d10s and keeps the highest 2 rolls
+            {command_prefix}roll 20d100dl2dh5 -> rolls 20 d100s and removes the lowest 2 and highest 5 rolls
+            {command_prefix}roll 5d6+10 -> rolls 5 d6 and adds 10 to the result
+            {command_prefix}roll d8*5 -> rolls a d8 and multiplies the result by 5
+            {command_prefix}roll 3d10q -> rolls 3 d10s with a quantum random number as a seed
+
+        TODO - make the input parsing code less of a nightmare
+        """
+        simplify_output = False #determines if the final output is simplified (to remove clutter)
+        inputs = message.content.strip().split(" ")
+        inputs.pop(0)
+        if len(inputs)==0:
+            inputs.append("1d6")
+            simplify_output = True
+        elif len(inputs)==1:
+            simplify_output = True
+
+        for i in range(len(inputs)): #Because it bothers me: Denote the default 'd6' when it's not mentioned. Only affects clarity of output.
+            if not "d" in inputs[i].replace("dl","").replace("dh",""):
+                inputs[i] = inputs[i]+"d6"
+                simplify_output = False
+
+        parsed = []
+        try:
+            for input in inputs:
+                if ("dl" in input and "kl" in input) or ("dh" in input and "kh" in input) or ("kl" in input and "kh" in input):
+                    raise AttributeError #incompatible tokens are present - (e.g. cannot keep highest and keep lowest simultaneously)
+                parse = self.parse_roll(input)
+                if parse[2]+parse[4]>parse[0] or parse[3]>parse[0] or parse[5]>parse[0]:
+                    raise AttributeError #there's not enough total rolls to work properly
+                if parse[0]>500:
+                    raise ValueError #roll limit
+                parsed.append(parse)
+        except ValueError:
+            await channel.send("Sorry, but the limit on the number of rolls you can make at once is 500",delete_after=30)
+            return
+        except AttributeError:
+            await channel.send("Those values are incompatible, sorry",delete_after=30)
+            return
+        except IndexError:
+            await channel.send("I had trouble parsing your input. Use `&help roll` to learn how the command should look.",delete_after=30)
+            return
+
+        output = ""
+        for i in range(len(parsed)):
+            p = parsed[i]
+            rolls = []
+            if p[8]==1: #quantum flag is True
+                #print("QTM")
+                qrng = get_data()[0] #seed the rng with a quantum random number
+                #print(qrng)
+                random.seed(qrng)
+            for j in range(p[0]):
+                
+                roll = random.randint(1,p[1])
+                rolls.append(roll)
+
+            dl = p[2] if p[2]>0 else (p[0]-p[5] if p[5]>0 else 0) #number of minimums to delete
+            dh = p[4] if p[4]>0 else(p[0]-p[3] if p[3]>0 else 0) #number of maximums to delete
+
+            minimums = self.minimums(rolls, dl)
+            maximums = self.maximums(rolls, dh)
+            line = ""
+            sum = 0
+            for roll in rolls:
+                if roll in minimums:
+                    line+="~~"+str(roll)+"~~, "
+                    minimums.remove(roll)
+                elif roll in maximums:
+                    line+="~~"+str(roll)+"~~, "
+                    maximums.remove(roll)
+                else:
+                    line+=str(roll)+", "
+                    sum+=roll
+
+            line = line[:-2] #this works apparently - removes trailing comma
+            if p[6]!=0 or p[7]!=1 or len(rolls)>2 or (len(rolls)>1 and sum>20): #is it necessary to display a total?
+                line += "   Total: "+str(sum) + (" * "+str(p[7]) if p[7]!=1 else "") + (" + "+str(p[6]) if p[6]!=0 else "")
+                if p[7]!=1 or p[6]!=0:
+                    line+= " = "+str(sum*p[7]+p[6])
+            if simplify_output:
+                output+=line+"\n"
+            else:
+                output+="_"+inputs[i]+":_   "+line+"\n"
+        await channel.send(output)
+        return
+
+    async def cmd_addquote(self, message, channel, reactedMessage=None):
+        """
+        Usage:
+            {command_prefix}addquote
+
+        Aliases:
+            {command_prefix}addquo
+            {command_prefix}addq
+
+        Saves a message to the quote database. The message using the command must be a reply to the message you wish to quote. The quotes can be retrieved with the {command_prefix}quo command.
+        """
+        if not reactedMessage:
+            if not (message.reference and message.reference.resolved):
+                await channel.send("Sorry, you need to reply to a message when using that command",delete_after=15)
+                return
+            old_message = await channel.fetch_message(message.reference.message_id)
+        else:
+            old_message = reactedMessage #for when adding quotes based on the camera emoji reaction
+
+        old_author = old_message.author
+        guildID = str(old_message.channel.guild.id)
+        timestamp = (old_message.created_at-timedelta(hours=5)).strftime("%m/%d/%Y at %H:%M:%S (ET)")
+        new_quote = old_message.content.replace("\n"," ").strip()
+        #if old_author == self.user:
+        #    await channel.send("Nice try.",delete_after=10)
+        #    return
+        if len(new_quote)<3:
+            await channel.send("Sorry, that quote is too short.",delete_after=10)
+            return
+        name = old_author.name #old_author.name if not old_author.nick else old_author.nick #uncomment to save nicknames instead of usernames
+        quote_dict = {"author":name, "avatar_url":str(old_author.avatar_url), "guild_id":guildID, "timestamp":timestamp, "quote":new_quote}
+        with open(os.path.abspath("misc_data/quotes.txt"),"a") as f:
+            f.write("\n")
+            f.write(json.dumps(quote_dict))
+        await message.add_reaction("✅")
+        return
+
+    async def cmd_quote(self, message, channel):
+        """
+        Usage:
+            {command_prefix}quote [search text]
+            {command_prefix}quote
+
+        Aliases:
+            {command_prefix}quo
+
+        Retrieves all saved quotes containing [search text]. If no search text is provided, retrieves a random quote.
+        """
+        try: #this is the only way I could think of doing this
+            search_text = message.content.split(" ",1)[1].replace("\n"," ").strip().lower()
+        except IndexError:
+            search_text=""
+        if len(search_text)<3 and len(search_text)>0:
+            await channel.send("Please use a longer search string.",delete_after=10)
+            return
+        with open(os.path.abspath("misc_data/quotes.txt"),"r") as f:
+            lines = f.readlines()
+        matches = []
+        if len(search_text)==0: #no quote specified - find a random one from the same guild
+            while len(lines)>0:
+                line = lines.pop(0)
+                if not line.strip() or line.startswith("##"):
+                    continue
+                quote_dict = json.loads(line)
+                if channel.guild.id == int(quote_dict["guild_id"]):
+                    matches.append(quote_dict)
+            matches = [random.choice(matches)]
+        else:
+            while len(lines)>0:
+                line = lines.pop(0)
+                if not line.strip() or line.startswith("##"):
+                    continue
+                quote_dict = json.loads(line)
+                if search_text in quote_dict["quote"].lower() and channel.guild.id == int(quote_dict["guild_id"]):
+                    matches.append(quote_dict)
+
+        counter = 0
+        for match in matches:
+            if counter>100: #the limit for quote matches sent
+                await channel.send("The maximum number of matching quotes has been reached! ("+str(counter-1)+" quotes)")
+                break
+            quote = match["quote"]
+            #author_name = quote_info[0]
+            #author_imgurl = quote_info[1]
+            #guildID = int(
+            #timestamp = quote_info[3]
+            if len(quote)<=250:
+                embed = discord.Embed(title=quote,color=discord.Color.from_rgb(136, 36, 242))
+            else:
+                embed = discord.Embed(color=discord.Color.from_rgb(136, 36, 242))
+                embed.add_field(name="_ _",value=quote)
+            embed.set_author(name="A Quote from "+match["author"],icon_url=match["avatar_url"])
+            embed.set_footer(text=match["timestamp"])
+            await channel.send(embed=embed)
+            counter += 1
+        if len(matches)==0:
+            await channel.send("Sorry, there are no quotes that contain that substring. Maybe you mistyped?",delete_after=15)
+            return
+        return
+
+    #converts a user with a given id into a margaret across all guilds. Also records their previous username to the margaret file.
+    #will not prevent the user from changing their username unless it's the weekend and they are listed in the margaret id list (in custom configs)
+    async def margaret(self,id):
+        print("Marging: "+str(id))
+        count = 0
+        margarets = []
+        for g in self.guilds:
+            try:
+                member = await g.fetch_member(id)
+            except: #If you can't find them, just skip and move on (I'm too lazy to do real error handling)
+                print("Problem getting member: {} from guild {}".format(str(id),g.name)) 
+                continue
+            
+            old_nick = member.nick
+            if old_nick==None:
+                old_nick = member.name
+            save_string = str(g.id)+";;"+str(member.id)+";;"+old_nick
+            margarets.append(save_string)
+            try:
+                await member.edit(nick="{ig}Margaret")
+                count+=1
+            except:
+                margarets.pop()
+
+        if len(margarets)==0:
+            print("    No marging possible")
+            return
+
+        with open(os.path.abspath("misc_data/margs.txt"),"a") as f:
+            for marg in margarets:
+                f.write("\n")
+                f.write(marg)
+        print("    Marging done in servers: "+str(count))
+        return
+
+    #undoes all current margarets and deletes the margaret save file
+    async def unmargaret_all(self):
+        print("Starting unmarging")
+        count = 0
+        with open(os.path.abspath("misc_data/margs.txt"),"r") as f:
+            lines = f.readlines()
+        for line in lines:
+            if not line.strip():
+                continue
+            info = line.split(";;",2)
+            try:
+                search_guild = self.get_guild(int(info[0]))
+                search_member = await search_guild.fetch_member(int(info[1]))
+                try:
+                    await search_member.edit(nick=info[2])
+                    count +=1 
+                except:
+                    print("THERE WAS AN UNMARGING ERROR!: Could not reset name: "+line)
+            except:
+                print("THERE WAS AN UNMARGING ERROR!: Could not find guild and/or member from: "+line)
+        await self.run_cli("rm "+os.path.abspath("misc_data/margs.txt")) #cleanup afterwards
+
+        print("Finished unmarging members: "+str(count))
+        return
+
+
+    def load_configs(self):
+        """
+        Reloads the custom config variables from MusicBot/config/custom_configs.txt.
+        TODO - use ConfigParser to make this much much easier.
+        """
+        print("RELOADING CUSTOM CONFIGS")
+        with open(os.path.abspath("config/custom_configs.txt"),"r") as f:
+            lines = f.readlines()
+        for line in lines:
+            if not line.strip() or line.startswith("##"): #comment line
+                continue
+
+            before = line.split("::")[0].strip()
+            try:
+                after = line.split("::")[1].strip()
+            except IndexError:
+                after = ""
+            inputs = after.split(",")
+            if len(inputs)==1 and not inputs[0]: #this is necessary when there's no input values
+                inputs=[]
+
+            if before=="ANYWHERE_COMMANDS":
+                self.anywhere_commands = []
+                for input in inputs:
+                    self.anywhere_commands.append(input)
+                #print(self.anywhere_commands)
+
+            elif before=="DM_COMMANDS":
+                self.dm_commands = []
+                for input in inputs:
+                    self.dm_commands.append(input)
+                #print(self.dm_commands)
+
+            elif before=="MARGARET_IDS":                
+                self.margaret_ids = []
+                for input in inputs:
+                    self.margaret_ids.append(int(input))
+                #print(self.margaret_ids)
+
+            elif before=="PORTMANTEAU_EXCLUDES":
+                self.portmanteau_excludes = []
+                for input in inputs:
+                    self.portmanteau_excludes.append(input)
+                #print(self.portmanteau_excludes)
+
+            elif before=="UNFUN_GUILDS":                
+                self.unfun_guilds = []
+                for input in inputs:
+                    self.unfun_guilds.append(int(input))
+                #print(self.unfun_guilds)
+
+            elif before=="MAX_DAILY_GOKUS":
+                self.max_daily_gokus = int(after)
+                #print(self.max_daily_gokus)
+
+            elif before=="RESPONSE_FREQUENCY":
+                self.response_frequency = float(after)
+                #print(self.response_frequency)
+
+            elif before=="MAX_RESPONSES":
+                self.max_responses = int(after)
+                #print(self.max_responses)
+
+            elif before=="POOP_PROBABILITY":
+                self.poop_probability = float(after)
+                #print(self.poop_probability)
+
+            elif before=="SLOPPINESS_MULTIPLIER":
+                self.sloppiness_multiplier = float(after)
+                #print(self.sloppiness_multiplier)
+
+            else:
+                print("I have no idea what this means: "+before)
+        return
+
+    def clean_audio_cache(self):
+        """
+        Iterates through the audio_cache folder and removes all songs that haven't been played recently.
+        DAY_LIMIT is the maximum number of days a song can remain inactive.
+        """
+        DAY_LIMIT = 15
+        print("CLEANING AUDIO CACHE NOW")
+        file_list = os.listdir(os.path.abspath("audio_cache"))
+        for file in file_list:
+            days_since_edit = (int(time.time()) - os.path.getctime(os.path.abspath("audio_cache/"+file)))/24/3600
+            #print(str(days_since_edit)+" "+file)
+            if days_since_edit>DAY_LIMIT:
+                print("    REMOVING: "+str(days_since_edit)+"   "+os.path.abspath("audio_cache/"+file))
+                os.remove(os.path.abspath("audio_cache/"+file))
+        print("DONE")
+        return
+
+    #clears out the text files parsed from images throughout the day
+    def clean_image_cache(self):
+        print("CLEANING IMAGE CACHE NOW")
+        file_list = os.listdir(os.path.abspath("image_cache"))
+        for file in file_list:
+                os.remove(os.path.abspath("image_cache/"+file))
+        print("DONE")
+        return
+
+    @dev_only
+    async def cmd_reboot(self,message):
+        """
+        Usage:
+            {command_prefix}reboot
+        Reboots the bot's computer. The bot should automatically restart afterwards if systemd is configured properly.
+        """
+        await message.add_reaction("✅")
+        try:
+            await self.alert_owner("Rebooting now!")
+            self.scorekeeper.save(force_all=True)
+            await self.cmd_autosave(None)
+            await self.logout()
+            await self.run_cli("sudo reboot now")
+        except:
+            await message.add_reaction("❗️") #when something goes wrong
+
+    @dev_only 
+    async def cmd_cancelreboot(self,message):
+        """
+        Usage:
+            {command_prefix}cancelreboot
+        If the bnuuy has started a reboot sequence, it will cancel it. Otherwise, idk. Maybe it starts a reboot, who knows?
+        """
+        await self.alert_owner("Naptime is cancelled!")
+        await self.run_cli("sudo shutdown -c")
+        await message.add_reaction("✅")
+
+
+    #notifies the owner, then starts the reboot process (30 minutes until reboot)
+    #TODO - figure out how to make this safer
+    async def start_reboot(self):
+        await self.alert_owner("Rebooting in 30 minutes!")
+        await self.run_cli("sudo shutdown -r +30")
+        self.scorekeeper.save(force_all=True)
+
+    #checks if the time has come to reboot, and starts the reboot process if so.
+    async def reboot_maybe(self):
+        self.days_until_reboot -= 1
+        print("REBOOT CHECK: Days to Reboot: "+str(self.days_until_reboot))
+        #await self.alert_owner("Shutdown in "+str(self.days_until_reboot)+" days")
+        if self.days_until_reboot <= 0:
+            await self.start_reboot()
+
+    #Tasks that run at midnight every night. Includes conditional statements for every day of the week.
+    @tasks.loop(seconds=30.0,minutes=59.0,hours=23.0)
+    async def midnight_loop(self):
+
+        tomorrow = datetime.now() + timedelta(days=1)
+        midnight = datetime(year=tomorrow.year, month=tomorrow.month, day=tomorrow.day, hour=0, minute=0, second=0)
+        seconds_to_midnight = (midnight-datetime.now()).seconds
+        print("Midnight Loop: Waiting for "+str(seconds_to_midnight)+" seconds")
+        await asyncio.sleep(seconds_to_midnight+2)
+        print("Done waiting")
+        print("Midnight Loop starting at "+datetime.now().strftime("%m/%d/%Y at %H:%M:%S ET"))
+
+        if datetime.today().weekday()==0: #Monday
+            print("=====MONDAY=====")
+            await self.unmargaret_all()
+        if datetime.today().weekday()==1: #Tuesday
+            print("=====TUESDAY=====")
+        if datetime.today().weekday()==2: #Wednesday
+            print("=====WEDNESDAY=====")
+        if datetime.today().weekday()==3: #Thursday
+            print("=====THURSDAY=====")
+        if datetime.today().weekday()==4: #Friday
+            print("=====FRIDAY=====")
+        if datetime.today().weekday()==5: #Saturday
+            print("=====SATURDAY=====")
+            for user_id in self.margaret_ids:
+                await self.margaret(user_id)
+        if datetime.today().weekday()==6: #Sunday
+            print("=====SUNDAY=====")
+
+        #Daily stuff
+        await self.cmd_shower(None)     #take a shower to clean out the caches and stuff
+        await self.cmd_autosave(None)   #make an autosave of the misc_data in case something fucky happens
+        #await self.send_birthdays()     #Send bday reminders
+        await self.reboot_maybe()       #check if we should reboot in 30 minutes
+
+    @dev_only
+    async def cmd_midnighttest(self, message):
+        """
+        Usage:
+            {command_prefix}midnighttest
+
+        Manually triggers the midnight loop once.
+        """
+
+
+    @dev_only
+    async def cmd_shower(self, message):
+        """
+        Usage:
+            {command_prefix}shower
+
+        Manually runs the nighttime cleanup methods. (cleans: audio_cache, image_cache, goku_attempts, daily emotion)
+        """
+        self.clean_audio_cache()
+        self.clean_image_cache()
+        print("CLEANING SCOREBOARDS NOW")
+        await self.run_cli("rm "+os.path.abspath("misc_data/scoreboards/goku_attempts.json"))
+        await self.run_cli("rm "+os.path.abspath("misc_data/scoreboards/wordle_attempts.json"))
+        await self.run_cli("rm "+os.path.abspath("misc_data/scoreboards/wordle_finished.json"))
+        self.scorekeeper.load()
+        print("DONE")
+        #print(self.scorekeeper.scoreboards)
+        self.set_secret_word()
+        await self.new_emotion()
+        print("RESEEDING QRNG")
+        try:
+            random.seed(get_data()[0]) #reseed the RNG with a new quantum random number (takes some time)
+        except:
+            pass
+        print("DONE")
+        if message:
+            await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_autosave(self, message):
+        """
+        Usage:
+            {command_prefix}autosave
+        
+        Zips up a couple of important files/directories.
+        Runs automaticallly every midnight and just before shutdown or reboot is run.
+        I understand the irony of "autosave" being a manual command, but the function is mostly used internally.
+        """
+        print("AUTOSAVING STUFF")
+        autosave_files = ["misc_data"] #add more files/directories here as necessary
+        for file in autosave_files:
+            command_string = "zip -r "+os.path.abspath(file)+"-autosave "+os.path.abspath(file)
+            #print(command_string)
+            result = await self.run_cli(command_string)
+            print("DONE")
+            #print(result)
+        if message:
+            await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_margtest(self,message,channel):
+        """Margs everyone in the margaret_id list"""
+        for user_id in self.margaret_ids:
+            try:
+                await self.margaret(user_id)
+            except:
+                pass
+        return
+
+    @dev_only
+    async def cmd_unmargtest(self,message,channel):
+        """Unmargs everyone who is currently marg-ed"""
+        await self.unmargaret_all()
+        return
+
+    @dev_only
+    async def cmd_clearytcache(self, message, channel):
+        """
+        Usage:
+            {command_prefix}clearytcache
+
+        Clears the youtube-dl download cache. Use this when you suspect youtube-dl may be acting up. (Specifically in the case of HTTPException: 403 Forbidden).
+        """
+        output = await self.run_cli("youtube-dl --rm-cache-dir")
+        if output[1].strip():
+            await message.add_reaction("😳")
+            print(output[1])
+        else:
+            await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_reloadconfigs(self, message, channel):
+        """
+        Usage:
+            {command_prefix}reloadconfigs
+
+        Reloads the custom config variables. NOTE: Doesn't reload any of the regular configs, only the custom ones I added.
+        """
+        #try:
+        self.load_configs()
+        await message.add_reaction("✅")
+        #except:
+            #await message.add_reaction("😳")
+        return
+
+    async def cmd_dadjoke(self, channel):
+        """
+        Usage:
+            {command_prefix}dadjoke
+
+        Gives you a random dad joke!
+        """
+        with open(os.path.abspath("misc_data/dadjokes.txt"),"r") as f:
+            random_joke=""
+            while not random_joke.strip():
+                random_joke=random.choice(f.readlines())
+        lines = random_joke.split(";;")
+        for line in lines:
+            await channel.send(line,delete_after=60)
+            await asyncio.sleep(4)
+        return
+
+
+    def changeScoreboard(self, id, scoreboard_name, value=1, increment=True):
+        """
+        Used to save/alter an abstracted scoreboard for users. Scoreboard files are saved under misc_data/scoreboards/. If no file is found, a new one is created.
+        id -- user's discord ID (integer)
+        scoreboard_name -- the name for the scoreboard
+        number -- the number used to set/alter the scoreboard
+        increment -- if True, increments an existing value for the user. if False, overwrites an existing value. (if a value doesn't exist yet, this will make no difference)
+
+        TODO - remove this method, as it is just a scorekeeper wrapper at this point
+        """
+        return self.scorekeeper.change_score(id, scoreboard_name, value=value, increment=increment)
+
+
+    #wrapper for setting a scoreboard to a specific value
+    def setScoreboard(self, id, scoreboard_name, value):
+        return self.scorekeeper.set_score(id, scoreboard_name, value=value)
+
+    #wrapper for getting the scoreboard value for a specific user. If no value exists, this will also assign them a value of 0.
+    def getScoreboard(self, id, scoreboard_name):
+        return self.scorekeeper.get_score(id, scoreboard_name, show_none=False)
+
+
+    def getScoreboardList(self, scoreboard_name, count=10, guild_id=None):
+        """
+        retrieves the [count] top scoreboard lines from a scoreboard file (returns as list of Strings)
+        if guild_id is specified, it will ignore users not in the specified guild
+        returns a sorted list of strings, but the format is weird: [user_id];;[score]
+        TODO - actually implement dict processing
+        """
+
+        scores_dict = self.scorekeeper.get_scoreboard(scoreboard_name, show_none=False)
+        lines=[]
+        for key in scores_dict:
+            if key=="__saved__":
+                continue
+            try:
+                lines.append(key+";;"+str(int(scores_dict[key]))) #this is a hacky fix - only allows int scores
+            except TypeError: #in case a score is not an int or something
+                continue
+
+        lines = sorted(lines, key=lambda line: int(line.split(";;",1)[1])) #Sorts list in order of score. Not sure how I would do this to a dict.
+
+        guild = self.get_guild(guild_id) if guild_id else None
+        board = []
+        for i in range(len(lines)-1,-1,-1):
+            line = lines[i].replace("\n","")
+            if len(board)>=count:
+                break
+            if guild and not guild.get_member(int(line.split(";;",1)[0])):
+                continue
+            board.append(line)
+
+        #remove trailing zeros - done at the end in case you want a scoreboard that can go negative
+        for i in range(len(board)-1,-1,-1):
+            count = int(board[i].split(";;",1)[1])
+            if count != 0:
+                break
+            else:
+                board.pop(i)
+        return board
+
+    
+    def getScoreboardListPretty(self, scoreboard_name, count=10, guild_id=None):
+        """
+        wrapper for getScoreboardList. Formats the lines into a readable ranked list (rank, username, score)
+        returns a list of Strings
+        """
+        board = self.getScoreboardList(scoreboard_name, count, guild_id)
+        nice_board = []
+        counter = 0
+        last_score = 0
+        for line in board:
+            line_info = line.split(";;",1)
+            if int(line_info[1])<last_score or last_score==0:
+                counter += 1
+                last_score = int(line_info[1])
+            user = self.get_user(int(line_info[0]))
+            user = user if user else self.fetch_user(int(line_info[0])) #hopefully it doesn't come down to this
+            nice_board.append(str(counter)+".   "+user.name+":    "+line_info[1])
+
+        return nice_board
+
+    #grabs the User object(s) for the top user(s) of the specified scoreboard. Returns them in a list.
+    #if guild_id is specified, will only search for users in the given guild
+    def getScoreboardTop(self, scoreboard_name, guild_id=None):
+        board = self.getScoreboardList(scoreboard_name, count=1, guild_id=guild_id)
+        if len(board)==0:
+            return None
+        users = []
+        top_score = int(board[0].split(";;",1)[1])
+        for b in board:
+            user_id = int(b.split(";;",1)[0])
+            user_score = int(b.split(";;",1)[1])
+            if user_score<top_score:
+                break
+            user = self.get_user(user_id)
+            user = user if user else self.fetch_user(user_id)
+            users.append(user)
+        
+        return users
+
+    async def cmd_goku(self, message, channel):
+        """
+        Usage:
+            {command_prefix}goku
+
+        Gives you a ranked list of the top Gokus on your server.
+        """
+
+        board = self.getScoreboardListPretty("goku", count=10, guild_id=channel.guild.id)
+        output_string=""
+        for line in board:
+            output_string+=line+"\n"
+        output_string = output_string if output_string else "There are no Gokus :("
+
+        embed = discord.Embed(color=discord.Color.from_rgb(255, 152, 56))
+        embed.set_author(name="TOP GOKUS",icon_url="https://cdn.discordapp.com/attachments/886765649827872820/903364619370909706/JyhZpbtu_400x400.jpg")
+        embed.add_field(name = output_string, value = "_ _")
+        embed.set_footer(text="Goku says 'Say no to drugs!'")
+        await channel.send(embed=embed, delete_after = 60)
+        return
+
+    async def cmd_pooperscooper(self, message, channel):
+        """
+        Usage:
+            {command_prefix}pooperscooper
+        Aliases:
+            {command_prefix}poops
+        Gives you a ranked list of the top pooper scoopers.
+        """
+
+        board = self.getScoreboardListPretty("pooper_scooper", count=10, guild_id=channel.guild.id)
+        output_string=""
+        for line in board:
+            output_string+=line+"\n"
+        output_string = output_string if output_string else "There are no pooper scoopers here :("
+
+        embed = discord.Embed(color=discord.Color.from_rgb(148, 80, 34))
+        embed.set_author(name="🔫🏆",icon_url="https://cdn.discordapp.com/attachments/886765649827872820/930575206215475240/poop-emojis-archives-jason-graham-4.png")
+        embed.add_field(name = output_string, value = "_ _")
+        embed.set_footer(text="Thank you for cleaning up my shit")
+        await channel.send(embed=embed, delete_after = 60)
+        return
+
+    async def cmd_wordletop(self, message, channel):
+        """
+        Usage:
+            {command_prefix}wordletop
+
+        Gives you a ranked list of the top wordle scorers on your server.
+        """
+
+        board = self.getScoreboardListPretty("wordle_wins", count=10, guild_id=channel.guild.id)
+        output_string=""
+        for line in board:
+            output_string+=line+"\n"
+        output_string = output_string if output_string else "There are no wordle winners :("
+
+        embed = discord.Embed(color=discord.Color.from_rgb(16, 232, 110))
+        embed.set_author(name="TOP WORDLERS")#,icon_url="https://cdn.discordapp.com/attachments/886765649827872820/903364619370909706/JyhZpbtu_400x400.jpg")
+        embed.add_field(name = output_string, value = "_ _")
+        embed.set_footer(text="Goku says 'Say no to drugs!'")
+        await channel.send(embed=embed, delete_after = 60)
+        return
+
+    #grabs a random emotion
+    def get_daily_emotion(self):
+        seed_number = (datetime.now()-datetime(day=1, month=1, year=1)).days #ensures the word doesn't change when bot restarts
+        with open(os.path.abspath("misc_data/emotions.txt"),"r") as f:
+            random.seed(seed_number)
+            return random.choice(f.readlines())
+
+    #updates the current emotion status
+    async def new_emotion(self):
+        await self.change_presence(activity=discord.Game(name="Emotion: "+self.get_daily_emotion()))
+
+    @dev_only
+    async def cmd_cum(self, message, channel):
+        """
+        Usage:
+            {command_prefix}cum
+        Displays the cum leaderboard counter. TODO - make cum leaderboard counter.
+        """
+        return
+
+    @dev_only
+    async def cmd_regenemotion(self,message):
+        """
+        Usage:
+            {command_prefix}regenemotion
+        Regenerates the daily emotion. Happens automatically at midnight.
+        """
+        await self.new_emotion()
+        await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_svoe(self, message, channel):
+        """
+        Usage:
+            {command_prefix}esvoe
+        Runs the ESVOE (enhanced subject verb object extraction) stuff on a message to see the subject, verb, and object.
+        Very slow (takes ~72 seconds to load the model). Not practical for use :\.
+        """
+        await message.delete()
+        test_text = ""
+        async for elem in channel.history(limit=1):
+            test_text = elem.content
+            break
+        if not test_text.strip():
+            await channel.send("Sorry, no text was found",delete_after=15)
+            return
+        test_text = test_text.replace("‘","'").replace("'s"," is").replace("'t"," not")
+        start_time = time.time()
+        file_text = "import sys\nfrom subject_verb_object_extract import findSVOs, nlp\nstring = \""+test_text+".\"\nsys.stdout.write(str(findSVOs(nlp(string))))"
+        with open("/home/pi/ESVOE/test.py","w") as f:
+            f.write(file_text)
+        out = await self.run_cli("python3 /home/pi/ESVOE/test.py")
+        await channel.send("SVOs: "+str(out[0])+" , Time: "+str(round(time.time()-start_time,3))+" seconds")
+        return
+
+
+    async def run_cli(self,cmd):
+        """
+        Runs a shell command without blocking async tasks.
+        Returns a list of strings containing the stdout, stderr, and exit code (in that order)
+        """
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+
+        stdout, stderr = await proc.communicate()
+        output = ["","",""]
+        if stdout:
+            output[0]= str(f'{stdout.decode()}')
+        if stderr:
+            output[1]= str(f'{stderr.decode()}')
+        output[2]= str(f'[{cmd!r} exited with {proc.returncode}]')
+        return output
+
+    @dev_only
+    async def cmd_summary(self, message, channel):
+        """
+        Usage:
+            {command_prefix}summary [#] [url]
+            {command_prefix}summary [url]
+
+        Summarizes the contents of some webpage in a specified number of sentences (defaults to 10 if unspecified).
+        Results may vary.
+        """
+        contents = message.content.split(" ")
+        url = ""
+        sentence_count = 10
+        if len(contents)==1:
+            await channel.send("You need to specify a url! Use \"&help summary\" for help.",delete_after=15)
+            return
+        elif len(contents)==2:
+            url = contents[1]
+        elif len(contents)==3:
+            try:
+                sentence_count = int(contents[1])
+            except:
+                await channel.send(contents[1]+" is not a valid sentence number",delete_after=15)
+                return
+            if sentence_count<0 or sentence_count>40:
+                await channel.send("Please choose a more reasonable number",delete_after=15)
+                return
+            url = contents[2]
+        else:
+            await channel.send("You're using the command wrong! Use \"&help summary\" for help.",delete_after=15)
+            return
+
+        wait_msg = await channel.send("Processing... (may take a minute)",delete_after=3600)
+
+        start_time = time.time()
+        output = await self.run_cli("sumy lex-rank --length="+str(sentence_count+1)+" --url="+url)
+        time_elapsed = time.time()-start_time
+        await message.add_reaction("✅")
+
+        output_text = ""
+        if output[1]:
+            output_text = "There was an error while reading that url!\nYour url is bad and you should feel bad!"
+            print("There was an exception while summarizing a url! Here's the error:\n"+output[1])
+        else:
+            output_text = output[0]
+
+        embed = discord.Embed(title="Summary",color=discord.Color.from_rgb(143, 175, 227))
+        output_lines = output_text.split(".")
+        embed.add_field(name = "Here's what I got:", value = output_lines[0]+".", inline=False)
+        if len(output_lines)>1:
+            for i in range(1,len(output_lines)):
+                if output_lines[i].strip():
+                    embed.add_field(name = "_ _", value = output_lines[i]+".",inline=False)
+        embed.set_footer(text="Completed in "+str(round(time_elapsed,1))+" seconds")
+        try:
+            await wait_msg.delete()
+        except:
+            print("Wha? Where did that message go?")
+        await channel.send(embed=embed)
+        return
+
+
+    async def cmd_choose(self, message, channel):
+        """
+        Usage:
+            {command_prefix}choose [choices]
+
+        Chooses one option from a list of semicolon-separated values.
+
+        Example:
+            {command_prefix}choose be a normal person;amogus sus imposter vent!
+        """
+        # Sanity-check the arguments.
+        argv = message.content.split(" ", 1) # Split the first argument off.
+        if (len(argv) == 1):
+            # We can't choose if there's only one argument (the command name)
+            await channel.send("I can't choose from that!", delete_after=10)
+            return
+        
+        # Create the list, and send a random selection from it.
+        choices = argv[1].split(";") # Choices are semicolon-delimited.
+        choice = random.choice(choices)
+        if not choice:
+            choice = "` `"
+        
+        await channel.send(choice, delete_after=15)
+        return
+
+    @dev_only
+    async def cmd_shell(self, message, channel):
+        """
+        Usage:
+            {command_prefix}shell [command]
+
+        Literally just runs the command in shell. No error checking whatsoever. Don't abuse this. Seriously.
+        Returns stdout, stderror, and exit codes after running the command.
+        """
+        command = message.content.split(" ",1)[1]
+        output = await self.run_cli(command)
+        output_text = "Output:\n"+output[0]+"\n\nErrors:\n"+output[1]+"\n\nExit Code:\n"+output[2]
+        if len(output_text)>1000:
+            output_splits = self.split_long_text(output_text)
+            for split in output_splits:
+                await channel.send(split)
+        else:
+            await channel.send(output_text)
+        return
+
+    @dev_only
+    async def cmd_echodm(self, message, channel):
+        """
+        Usage:
+            {command_prefix}echo [User ID] [text]
+
+        Functions similar to {command_prefix}echo, but this sends messages to the DM channels of the specified user.
+        As with the {command_prefix}echo command, you can include "react" tags in the message.
+        Note: Doesn't work with users who do not share a guild with the bot (I think).
+        """
+        try:
+            input_text = message.content.split(" ",1)[1].strip()
+        except IndexError:
+            input_text=""
+        try:
+            idstring = input_text.split(" ",1)[0]
+            if not len(idstring) == 18:
+                raise TypeError
+            user_id = int(idstring)
+
+            dm_message_text = input_text.split(" ",1)[1]
+            react_info = self.get_response_reactions(dm_message_text)
+            dm_message_text = react_info.pop(0)
+            if not dm_message_text.strip():
+                raise ValueError
+
+            search_user = self.get_user(int(idstring)) #avoid API call if possible
+            if not search_user:
+                search_user = await self.fetch_user(int(idstring))
+
+            dm_channel = await search_user.create_dm()
+            sent_message = await dm_channel.send(dm_message_text)
+            for emoji in react_info:
+                print(emoji)
+                await sent_message.add_reaction(emoji)
+
+        except TypeError:
+            await channel.send("That was not a valid user ID!",delete_after=30)
+            return
+        except ValueError:
+            await channel.send("Please specify the message you wish to send to the user.",delete_after=30)
+            return
+        except IndexError:
+            await channel.send("You are missing a required field! Please specify the user ID and then the message",delete_after=30)
+            return
+
+        await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_santa(self, message, channel):
+        """
+        Usage:
+            {command_prefix}santa [(name:)person1;person2;person3...]
+
+        Generates a named Secret Santa order, and records it to a list for later.
+            Name defaults to "Santa".
+
+        Each person can be a user id or a ping.
+        """
+        # Sanity-check the arguments.
+        argv = message.content.split(" ", 1) # Split the arguments.
+        if len(argv) < 2:
+            # We can't make a list if there's only one argument (the command name)
+            await channel.send("You have to provide people to choose from!", delete_after=10)
+            return
+        
+        name = "Santa"
+
+        if len(argv[1].split(":", 1)) > 1:
+            # The user provided a name.
+            name = argv[1].split(":", 1)[0]
+            argv[1] = argv[1].split(":", 1)[1]
+        
+        # People are mean and bad.
+        sanitized_name = name.lower().replace(" ", "")
+
+        # Get a list of the users provided. The input should come as "<@!{id}>", and we only care about {id}.
+        userIds = argv[1].split(";") # Users are semicolon-delimited.
+        # If the input is ok, the strings should all convert fine into ints.
+        try:
+            userIds = [int(userId.strip("<@! >")) for userId in userIds]
+        except ValueError:
+            await channel.send("Hey, that's not a valid user!", delete_after=10)
+            return
+        # Now convert them into users. If we've gotten here, they should all be valid IDs.
+        users = [self.get_user(userId) for userId in userIds]
+        if None in users:
+            await channel.send("Hey, that's not a valid user!", delete_after=10)
+            return
+        
+        # Decouple the shuffle logic from the writing logic.
+        originalOrder = users
+        # Pair block checking implementation goes here.
+        blocks = [(311910109049782274, 225717202609897472), (225717202609897472, 311910109049782274), (160146100588773377, 742124665148801056)]
+        blockPresent = True
+        while (blockPresent):
+            blockPresent = False
+            random.shuffle(users) # Shuffle the first time.
+            print(users)
+            for block in blocks:
+                for i in range(0, len(users) - 1):
+                    if (users[i].id == block[0] and users[i+1].id == block[1]):
+                        blockPresent = True
+                if (users[-1].id == block[0] and users[0].id == block[1]):
+                    blockPresent = True
+        
+        # We have a list of users now. Shuffle them, save the order, and DM the next person.
+        now = datetime.now().strftime('%Y-%m-%dT%H.%M.%S')
+        with open(os.path.abspath("misc_data/{}-{}.txt".format(sanitized_name, now)), "w") as f:
+            f.write("Participants: \n")
+            [f.write("{name}#{discriminator} ({id})\n".format(name = user.name, discriminator = user.discriminator, id = user.id)) for user in originalOrder]
+            f.write("\nOrder:\n")
+            for i in range(0, len(users) - 1):
+                f.write("{}#{} -> {}#{}\n".format(users[i].name, users[i].discriminator, users[i + 1].name, users[i + 1].discriminator))
+                await users[i].send("{}: Your target is {}#{}".format(name, users[i + 1].name, users[i + 1].discriminator))
+            f.write("{}#{} -> {}#{}\n".format(users[-1].name, users[-1].discriminator, users[0].name, users[0].discriminator))
+            await users[-1].send("{}: Your target is {}#{}".format(name, users[0].name, users[0].discriminator))
+        print("Finished generating " + name)
+        await message.add_reaction("✅")
+        return
+
+    async def cmd_balloon(self, channel):
+        """
+        Usage:
+            {command_prefix}balloon
+        Spawns a balloon in the channel! See how long you can keep it from hitting the floor!
+        """
+        def check(reaction, user):
+            return str(reaction.emoji)=="✋" and not user==self.user
+
+        #Run the game
+        count = 0
+        message = await channel.send("🎈 0!")
+        await message.add_reaction("✋")
+        while True:
+            try:
+                reaction, user = await self.wait_for('reaction_add', timeout=3.0, check=check) #Wait for reaction
+                await message.delete()
+                count += 1
+                message = await channel.send("🎈 "+str(count)+"!")
+
+                if random.random()<0.2:
+                    await message.add_reaction("❌") #sometimes add this to trick players
+                await message.add_reaction("✋")
+
+            except asyncio.TimeoutError: #Out of time error
+                try:
+                    await message.delete()
+                    await channel.send("Oops, the balloon hit the ground!")
+                except discord.errors.NotFound:
+                    await channel.send("Oops, the balloon got deleted!")
+                break
+            except: #Some other error
+                await channel.send("Oops, the balloon got deleted! (I think)")
+                raise
+                break
+        
+        #Send score report
+        await channel.send("Your score was "+str(count))
+        oldscore = self.scorekeeper.get_score(channel.id, "balloon_scores", show_none=False)
+        if oldscore < count:
+            newscore = self.scorekeeper.change_score(channel.id, "balloon_scores", value=count, increment=False)
+            await channel.send("💯 That's higher than this server's previous high score of "+str(oldscore)+"! 🎉")
+        elif oldscore == count:
+            await channel.send("That ties this server's record! 🎉")
+        else:
+            await channel.send("Unfortunately that doesn't beat ther server highscore of "+str(oldscore))
+        return
+
+
+    #determines if an input string or integer could be a discord user id
+    def is_valid_id(self,input):
+        if not len(str(input))==18:
+            return False
+        try:
+            test = int(input)
+            return True
+        except:
+            return False
+            
+
+    def text_to_datetime(self,input, recursive=False, timezone_offset=0):
+        """
+        Used to convert a variety of natural-language strings into datetime objects.
+        Some inputs formats operate under the assumption that the input time comes after the current system time.
+        input - string - the input text
+        timezone_offset - int - the timeszone offset for the current user (relative to the system's timezone). (currently unused) TODO - timezone stuff
+        recursive - bool - used internally to prevent endless recursion. Don't use this.
+        """
+        #hacky fix - convert "on" format to "at" format
+        if len(input.split(" "))>=3 and input.split(" ")[1]=="on":
+            on_split = input.split(" on ",1)
+            input = on_split[1]+" at "+on_split[0]
+
+        #start parsing
+        input_split = input.split(" at ",1)
+        if len(input_split)>2: #sanity check
+            raise IndexError
+        input = input_split[0].strip() #the part before the "at" (or the whole thing if there is not "at")
+
+        input = input.replace("today",datetime.now().strftime("%m/%d/%Y"))
+        input = input.replace("nexterday", "tomorrow").replace("tomorrow",(datetime.now()+timedelta(days=1)).strftime("%m/%d/%Y"))
+        input = input.replace("overmorrow",(datetime.now()+timedelta(days=2)).strftime("%m/%d/%Y"))
+        input = input.replace("noon","12:00").replace("bonky","16:00").replace("midnight","23:59:59") #in case of format 3
+
+        if "/" in input: #Format 1 - [date] at [time] - this section just parses [date]
+            numbers_split = input.split("/",2)
+            if len(numbers_split)==3:    #length 3-number date
+                month = int(numbers_split[0])
+                day = int(numbers_split[1])
+                year = int(numbers_split[2])
+                if year<100:
+                    year+=2000
+                time_day = datetime(year,month,day)
+
+            elif len(numbers_split)==2:  #length 2-number date - assume this year (or next year if already past)
+                now = datetime.now()
+                month = int(numbers_split[0])
+                day = int(numbers_split[1])
+                year = now.year
+                time_day = datetime(year,month,day)
+                if time_day < datetime.now():
+                    time_day = datetime(year+1,month,day)
+            else:
+                raise ValueError #invalid number of inputs
+
+        elif any(signifier in input for signifier in "YyMDWwdhms") and not any(sig in input.lower() for sig in ["am","pm",":"]): #Format 2 - time until - TODO- improve parsing to allow numbers in any order and throw exception on repeats
+            if not len(input_split)==1:
+                raise IndexError
+            input = input.replace("d","D").replace("y","Y").replace("w","W") #only uppercase these letters
+            years = 0 if not "Y" in input else int(input.split("Y",1)[0])
+            input = input.split("Y",1)[-1]
+            months = 0 if not "M" in input else int(input.split("M",1)[0])
+            input = input.split("M",1)[-1]
+            weeks = 0 if not "W" in input else int(input.split("W",1)[0])
+            input = input.split("W",1)[-1]
+            days = 0 if not "D" in input else int(input.split("D",1)[0])
+            input = input.split("D",1)[-1]
+            hours = 0 if not "h" in input else int(input.split("h",1)[0])
+            input = input.split("h",1)[-1] 
+            minutes = 0 if not "m" in input else int(input.split("m",1)[0])
+            input = input.split("m",1)[-1]
+            seconds = 0 if not "s" in input else int(input.split("s",1)[0])
+            input = input.split("s",1)[-1]
+
+            now = datetime.now()
+            time_day = datetime(now.year+years+int(math.floor((now.month+months-1)/12)),(now.month+months-1)%12+1,now.day,hour=now.hour,minute=now.minute,second=now.second)
+            time_day = time_day + timedelta(days=days+weeks*7,hours=hours,minutes=minutes,seconds=seconds)
+
+        elif ":" in input or "pm" in input or "am" in input or input.isnumeric(): #Format 3 - time without date - assumes today/tomorrow
+            if recursive:
+                raise IndexError #prevent infinite recursion
+            recursive_time = self.text_to_datetime("today at "+input,recursive=True)
+            if recursive_time < datetime.now():
+                recursive_time = self.text_to_datetime("tomorrow at "+input,recursive=True)
+            time_day = recursive_time
+
+        else:
+            raise ValueError
+
+        #parse the 'at' for format 1 if it exists
+        if len(input_split)==2:
+            at_input = input_split[1].lower().replace(" am","am").replace(" pm","pm")
+            use_pm = False
+            use_am = False
+            if at_input.endswith("am"):
+                at_input = at_input.replace("am","")
+                use_am = True
+            elif at_input.endswith("pm"):
+                at_input = at_input.replace("pm","")
+                use_pm = True
+            at_input = at_input.replace("noon","12:00").replace("bonky","16:00").replace("midnight","23:59:59")
+            numbers_split = at_input.split(":")
+            if len(numbers_split)<1 or len(numbers_split)>3: #sanity check
+                raise ValueError
+            hour = int(numbers_split[0])
+            if use_am:
+                if hour==12:
+                    hour = 0
+            elif use_pm:
+                if hour!=12:
+                    hour+=12
+            minute = 0 if len(numbers_split)==1 else int(numbers_split[1])
+            second = 0 if len(numbers_split)<=2 else int(numbers_split[2])
+            time_day = time_day + timedelta(hours=hour,minutes=minute,seconds=second)
+        return time_day
+
+    async def cmd_remind(self, message, channel):
+        """
+        Usage:
+            {command_prefix}remind [time] [message]
+
+        Sets a reminder for [time]. When [time] is reached, the bot will send your message and ping you.
+        If you mention other users in the reminder, the reminder will ping them as well. If the reminder was set in a DM channel with the bnuuy, a copy of the reminder will be sent to them.
+
+        There are three accepted time formats:
+            MM/DD/YYYY [at hh:mm:ss]
+                - sets the clock for a specified date and time
+                - the date may be replaced with "today" or "tomorrow"
+                - the date may be replaced with "noon" or "midnight"
+                - the part in brackets is optional. It defaults to midnight (00:00:00).
+                - replace the letters with the appropriate number value.
+                - two-digit years are also accepted (e.g. 1/1/20 refers to Jan 1, 2021)
+                - the year input can be omitted. It will default to the current year or next year if the day has already past.
+                - if AM or PM is not specified, 24-hour time will be used
+                - you may also switch the order to "[time] on [date]".
+            hh:mm:ss
+                - same as previous format, but assumes the date is either today or tomorrow, whichever hasn't happened yet
+                - IMPORTANT: be careful to specify "am" or "pm" to avoid accidentally setting a reminder for tomorrow morning instead of this afternoon.
+            #Y#M#W#D#h#m#s 
+                - sets the clock for a specified time duration after the current time
+                - the letters stand for years, months, weeks, days, hours, minutes, seconds
+                - replace the #-signs with numerical values, but keep the letters
+                - any value may be omitted - will default to zero
+                - numbers must be input in this order (for now)
+
+        Usage Examples:
+            {command_prefix}remind 9/12 bnuuy's birthday
+            {command_prefix}remind 3/14/15 at 9:26:54 pi day
+            {command_prefix}remind today at 21:30 commit war crimes
+            {command_prefix}remind tomorrow at 21:30 commit more war crimes
+            {command_prefix}remind 10m do homework
+            {command_prefix}remind 3Y1W3d7h2s welcome back @everyone (will ping everyone)
+        """
+        #split up inputs into the parts we want
+        #TODO - make this not a mess and allow message-less reminders
+        try:
+            message_content = message.content.strip().split(" ",1)[1]
+            time_string = message_content.split(" ",1)[0]
+            remind_message = message_content.split(" ",1)[1]
+            if remind_message.startswith("at "):
+                time_string += " at " + remind_message.split(" ",2)[1]
+                remind_message = remind_message.split(" ",2)[2]
+            elif remind_message.startswith("on "):
+                time_string += " on " + remind_message.split(" ",2)[1]
+                remind_message = remind_message.split(" ",2)[2]
+            if remind_message.startswith("am ") or remind_message.startswith("pm "):
+                time_string += remind_message[0:2]
+                remind_message = remind_message.split(" ",1)[1]
+        except IndexError:
+            await channel.send("Sorry, I couldn't parse that. Make sure you entered all the necessary information.",delete_after=30)
+            return
+
+        #get datetime object
+        try:
+            remind_time = self.text_to_datetime(time_string)
+        except ValueError:
+            await channel.send("That time could not be parsed! Try '&help remind' for information on accepted input formats.", delete_after=30)
+            return
+        except IndexError:
+            await channel.send("What you entered confuses and scares me. I cannot parse it.", delete_after=30)
+            return
+        if remind_time < datetime.now():
+            await channel.send("Please specify a time that hasn't already happened. I cannot break causality (yet).",delete_after=30)
+            return
+
+
+        #set the reminder
+        #print(remind_time.strftime("%YY%mM%dD%Hh%Mm%Ss")) #debug print
+        self.set_reminder(remind_time, channel.id, message.author.id, remind_message)
+        await message.add_reaction(random.choice("⏲⏰⏱🕰"))
+        await message.add_reaction("✅")
+        return
+
+    def set_reminder(self, time, channelID, userID, text):
+        """
+        Adds a reminder to the reminders list
+        time is a datetime object
+        """
+        #reminder_string = time.strftime("%m/%d/%Y at %H:%M:%S")+";"+str(channelID)+";"+str(userID)+";"+text
+        reminder_dict = {"time":time.strftime("%m/%d/%Y at %H:%M:%S"), "channel_id": channelID, "user_id": userID, "text":text}
+        with open(os.path.abspath("misc_data/reminders.txt"),"a") as f:
+            f.write(json.dumps(reminder_dict)+"\n")
+        if time < self.next_reminder: #check if this is the new next_reminder
+            self.next_reminder = time
+
+    async def cmd_reminders(self,message,channel):
+        """
+        Usage:
+            {command_prefix}reminders
+            {command_prefix}reminders [count]
+            {command_prefix}reminders all
+
+        Lists your currently active reminders (across all servers) in chronological order.
+        Your most recently set reminder will be indicated with an asterisk (*).
+        If no number is specified, defaults to 7. 'all' will list all reminders.
+        Regardless of what you enter, the maximum number that will be displayed is 30.
+        TODO - list reminder number
+        """
+        inputs = message.content.strip().split(" ",1)
+        count=7
+        if len(inputs)==2:
+            if inputs[1].isnumeric():
+                count = int(inputs[1])
+                if count>30:
+                    await channel.send("Sorry, that number is too big!",delete_after=30)
+                    return
+                elif count<1:
+                    await channel.send("Sorry, that number is too small!",delete_after=30)
+                    return
+            elif inputs[1].lower() == "all":
+                count = -1
+            else:
+                await channel.send("Sorry, I don't know what "+inputs[1]+" means.",delete_after=30)
+                return
+        elif len(inputs)>2:
+            await channel.send("Sorry, I don't understand that.",delete_after=30)
+            return
+
+        with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+            lines = f.readlines()
+        user_matches = []
+        for line in lines:
+            if not line.strip() or line.startswith("##"):
+                continue
+            dicty = json.loads(line.strip())
+            if dicty["user_id"] == message.author.id:
+                user_matches.append(dicty)
+        if len(user_matches)==0:
+            await channel.send("You do not have any reminders set at the moment",delete_after=60)
+            return
+
+        user_matches = sorted(user_matches, key=lambda date: (self.text_to_datetime(date["time"])-datetime.now()).total_seconds()) #Sort the list chronologically
+        try:
+            most_recent_reminder = self.get_recent_reminder(message.author.id)
+        except ValueError:
+            most_recent_reminder = None
+
+        nowtime = datetime.now()
+        today_string = nowtime.strftime("%m/%d/%Y")
+        tomorrow_string = (nowtime+timedelta(days=1)).strftime("%m/%d/%Y")
+        embed = discord.Embed(title = "Your Reminders:",color=discord.Color.from_rgb(252, 160, 131))
+        i=0
+        for match in user_matches:
+            i += 1
+            is_recent = False
+            if match == most_recent_reminder:
+                is_recent = True
+
+            match["time"] = match["time"].replace(today_string,"Today").replace(tomorrow_string,"Tomorrow")
+            embed.add_field(name="["+str(i)+("*] " if is_recent else "] ")+match["time"],value=match["text"],inline=False)
+            if (i>=count and count>0) or i>=30:
+                break
+        embed.title = "Your Next "+str(i)+" Reminders:"
+        embed.set_footer(text="Note: Each reminder will only be sent in the channel where you set them.")
+
+        await channel.send(embed=embed,delete_after=120)
+        return
+
+    async def cmd_removereminder(self, message, channel):
+        """
+        Usage:
+            {command_prefix}removereminder --> no input defaults to "recent"
+            {command_prefix}removereminder [reminder number]
+            {command_prefix}removereminder recent
+            {command_prefix}removereminder next
+            {command_prefix}removereminder last
+            {command_prefix}removereminder clearall
+            {command_prefix}removereminder [selection 1] [selection 2] [selection 3] ...
+
+        [reminder number] --> Removes a reminder given the reminder number (the number in the {command_prefix}reminders list).
+        recent --> removes your most recently set reminder (includes recently snoozed reminders).
+        next --> removes your next upcoming reminder (reminder #1)
+        last --> removes your last reminder chronologically. Note: if you have more than 30 reminders set, this will remove the 30th reminder (UNTESTED). 
+        clearall --> removes ALL of your reminders.
+
+        You may chain multiple inputs to remove several reminders at once. 
+        Duplicate selections will only remove one reminder. e.g. specifying "next" and then "1" will only remove the first reminder, not the first two.
+        
+        You cannot remove reminders set by other users.
+        Once a reminder is removed, it is gone forever!
+
+        Aliases: removerm, rmvreminder, rmvrm, rmrm
+        """
+        #parse out the inputs
+        inputs = message.content.strip().lower().split(" ")[1:]
+        inputs = list(filter(lambda x:x, inputs))
+        if len(inputs)==0:
+            inputs.append("recent")
+        inputs = list(set(inputs)) #remove duplicates
+
+        #Get list of reminders for the user sorted chronologically -- literally just copy-pasted from the function before this one
+        with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+            lines = f.readlines()
+        user_matches = []
+        for line in lines:
+            if not line.strip() or line.startswith("##"):
+                continue
+            dicty = json.loads(line.strip())
+            if dicty["user_id"] == message.author.id:
+                user_matches.append(dicty)
+        if len(user_matches)==0:
+            await channel.send("You do not have any reminders set at the moment",delete_after=60)
+            return
+        user_matches = sorted(user_matches, key=lambda date: (self.text_to_datetime(date["time"])-datetime.now()).total_seconds()) #Sort the list chronologically
+
+        #collect the reminders to be removed
+        to_remove = []
+        for input in inputs:
+            if input == "next":
+                to_remove.append(user_matches[0])
+            elif input == "last":
+                if len(user_matches)>30:
+                    to_remove.append(user_matches[29])
+                else:
+                    to_remove.append(user_matches[-1])
+            elif input=="recent":
+                try:
+                    to_remove.append(self.get_recent_reminder(message.author.id))
+                except ValueError:
+                    await channel.send("I'm sorry, but I couldn't find your most recent reminder. This may be a bug.\n(No reminders were removed)",delete_after=30) #Should never run
+                    return
+            elif input.isnumeric():
+                try:
+                    to_remove.append(user_matches[int(input)-1])
+                except IndexError:
+                    await channel.send("I'm sorry but this number is too large!: "+input+" (You don't have that many reminders set!)\n(No reminders were removed)",delete_after=30)
+                    return
+            elif input=="clearall":
+                to_remove = user_matches
+                break
+            else:
+                await channel.send("One of those inputs was invalid. Use `&help removereminder` if you need more information.\n(No reminders were removed)",delete_after=30)
+                return
+
+        #remove duplicates (can't cast to set because dicts aren't hashable or something)
+        seen = set()
+        new_l = []
+        for d in to_remove:
+            t = tuple(d.items())
+            if t not in seen:
+                seen.add(t)
+                new_l.append(d)
+        to_remove = new_l
+
+        #Generate confirmation embed (Doing this first because self.remove_matching_reminders(...) messes with the passed-in list)
+        output_string = ""
+        if "clearall" in inputs:
+            output_string="((all of them))"
+        else:
+            for rm in to_remove:
+                output_string += "\n"
+                output_string += (rm["text"][0:20]+"...") if len(rm["text"])>20 else rm["text"]
+            output_string = output_string[1:] #cut out first newline
+        embed = discord.Embed(title = "Removed the following reminders:",color=discord.Color.from_rgb(252, 160, 131))
+        embed.add_field(name="_ _",value=output_string,inline=False)
+        embed.set_footer(text="(Removed "+str(len(to_remove))+" reminder"+("s" if len(to_remove)>1 else "")+" in total)") 
+
+        #finally try to remove the reminders
+        try:
+            self.remove_matching_reminders(to_remove)
+        except ValueError:
+            await channel.send("I'm sorry, but I couldn't find some of the reminders you listed.\n(No reminders were removed)",delete_after=30)
+            return
+        
+        #Send the confirmation embed if everything worked out
+        await channel.send(embed=embed, delete_after=120)
+        return
+            
+    def remove_matching_reminders(self, reminder_dicts):
+        """
+        Removes the first occurance of every dict in reminder_dicts from reminders.txt.
+        Raises ValueError and removes nothing if no matches found for a particular input.
+        NOTE - This will remove stuff from the passed-in list.
+        TODO - Make that ^ not happen.
+        """
+        with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+            lines = f.readlines()
+        for i in range(len(lines)-1,-1,-1):
+            dicty = json.loads(lines[i].strip())
+            if any(dicty==rd for rd in reminder_dicts):
+                lines.pop(i)
+                reminder_dicts.remove(dicty)
+        if len(reminder_dicts)>0:
+            raise ValueError
+        with open(os.path.abspath("misc_data/reminders.txt"),"w") as f:
+            f.writelines(lines)
+
+    def get_recent_reminder(self, user_id):
+        """
+        Retrieves the dict of the lastest reminder with matching "user_id".
+        Raises ValueError if no matches found.
+        """
+        with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+            lines = f.readlines()
+        match_found = False
+        for i in range(len(lines)-1,-1,-1):
+            dicty = json.loads(lines[i].strip())
+            if str(dicty["user_id"])==str(user_id):
+                return dicty
+        raise ValueError
+
+
+    #used for reminders, but could be used elsewhere as well
+    #extracts all user mentions from a string and returns them as a list of strings - ex: ["<@!######>","<@!######>"]
+    #does not change the order or remove duplicates
+    def extract_mentions(self, input):
+        mentions = []
+        while "<@" in input:
+            input = input.split("<@",1)[1]
+            if input.startswith("!"):
+                input = input[1:len(input)]
+            if not ">" in input or len(input)<19:
+                return
+            #print(input[0:18])
+            if self.is_valid_id(input[0:18]) and input[18]==">":
+                mentions.append("<@!"+input[0:19])
+                input = input.split(">",1)[1]
+        return mentions
+        
+
+    #Checks through all reminders and sends them out when they expire
+    async def check_reminders(self):
+        now = datetime.now()
+        try:
+            with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            with open(os.path.abspath("misc_data/reminders.txt"),"w") as f:
+                print("Creating reminders.txt")
+            return
+
+        update_reminders = False #determines whether the remind.txt file should be rewritten afterwards
+        for i in range(len(lines)-1,-1,-1):
+            line = lines[i].strip()
+            if line.startswith("##"):
+                continue
+            if not line: #idk where this whitespace keeps coming from, but this should clear it
+                lines.pop(i)
+                update_reminders = True
+                continue
+
+            line_dict = json.loads(line)
+            time = self.text_to_datetime(line_dict["time"])
+            if not now>time: #not time yet
+                continue
+
+            #====SEND REMINDER(S)====#
+
+            try:
+                channel = self.get_channel(line_dict["channel_id"])
+                user = self.get_user(line_dict["user_id"])
+                channel = channel if channel else await self.fetch_channel(line_dict["channel_id"])
+                user = user if user else await self.fetch_user(line_dict["user_id"])
+                if not channel or not user:
+                    raise AttributeError
+            except AttributeError:
+                print("Error retrieving channel or user for reminder: "+line)
+                #raise
+                lines.pop(i)
+                update_reminders=True
+                continue
+
+            remind_message = line_dict["text"]
+
+            #TODO - regex to sub @e->@everyone and @h->@here if the user has appropriate server priviledges
+            #TODO - if user does not have appropriate permissions, make sure we don't @everyone or @here
+
+            remind_mentions = self.extract_mentions(remind_message)
+            try:
+                remind_mentions = list(set(remind_mentions)) #temporarily casting to set removes any duplicates
+
+            except TypeError: #not sure why, but this happens if sometimes if someone intentionally types an invalid mention
+                #print(":(")
+                remind_mentions = []
+            if user.mention.replace("<@","<@!") in remind_mentions: #remove original user if they mentioned themselves
+                remind_mentions.remove(user.mention.replace("<@","<@!"))
+
+            lines.pop(i) #remove the reminder from the list
+            update_reminders = True
+
+            embed = discord.Embed(title = "Time: "+time.strftime("%c"),color=discord.Color.from_rgb(255, 128, 43))
+            if len(remind_message)<200:
+                embed.add_field(name=remind_message, value = "_ _")
+            else:
+                embed.add_field(name="_ _", value = remind_message)
+            embed.set_footer(text="Use reactions to snooze (9 min) or delete this reminder.")
+
+            output_text = "Reminder for "+user.mention
+            if len(remind_mentions)>0:
+                output_text += " as well as"
+            for m in remind_mentions:
+                output_text += " "+m
+            if "@everyone" in remind_message:
+                output_text += " oh yeah and @everyone"
+            elif "@here" in remind_message:
+                output_text += " oh yeah and @here"
+
+            mymessage = await channel.send(content=output_text+"_ _",embed=embed)
+            await mymessage.add_reaction("💤")
+            await mymessage.add_reaction("❌")
+
+            #try to send DM reminders to the other mentioned users if necessary
+            if isinstance(channel, discord.abc.PrivateChannel) and len(remind_mentions)>0: 
+                count = 0
+                failcount = 0 #currently unused
+                for m in remind_mentions:
+                    try:
+                        mentioned_user = self.get_user(int(m.replace("<@","").replace("!","").replace(">",""))) #try doing it without an API call first
+                        if not mentioned_user:
+                            mentioned_user = await self.fetch_user(int(m.replace("<@","").replace("!","").replace(">","")))
+                        dm_channel = await mentioned_user.create_dm()
+                        await dm_channel.send("A DM reminder for "+user.name+" has mentioned you. Here is a copy of their reminder. (Responding to this message will do nothing)_ _",embed=embed)
+                        count += 1
+                    except:
+                        failcount += 1
+                        pass
+                await channel.send("Your reminder has been forwarded to "+str(count)+" mentioned user(s).")
+
+        #rewrite reminders.txt file if anything has been changed
+        if update_reminders:
+            with open(os.path.abspath("misc_data/reminders.txt"),"w") as f:
+                f.writelines(lines)
+            self.next_reminder = self.get_next_reminder() #this could be optimized by finding the min_time in the pass above, but that isn't really necessary
+
+        return
+
+    #gives a random text channel
+    def get_random_channel(self):
+        channel = None
+        while not isinstance(channel, discord.TextChannel):
+            channel = random.choice(random.choice(self.guilds).channels)
+        return channel
+
+    #gives a random text channel that is also not in the unfun_guilds list
+    def get_random_fun_channel(self):
+        channel = None
+        if len(self.unfun_guilds)>=len(self.guilds): #prevent an infinite loop
+            return None
+        while not isinstance(channel, discord.TextChannel) and not channel in self.unfun_guilds:
+            channel = random.choice(random.choice(self.guilds).channels)
+        return channel
+
+    #checks if it's time to poop and poops if necessary
+    async def dumpy_check(self):
+        if random.random()<self.poop_probability:
+            if len(self.unfun_guilds)+1>=len(self.guilds): #there are no eligible guilds to shit in (the +1 is to exclude the dev guild)
+                return
+            channel = self.get_random_fun_channel()
+            if not channel: #just being safe
+                return
+            while channel.guild.id==886765649018380349: #keep the dev server clean
+                channel = self.get_random_fun_channel()
+            mymessage = await channel.send("💩")
+            await mymessage.add_reaction("🔫")
+
+    @dev_only
+    async def cmd_dumpy(self, channel):
+        """
+        Usage:
+            {command_prefix}dumpy
+
+        Makes the rabbit take a dump. Used for debugging purposes only.
+        """
+        mymessage = await channel.send("💩")
+        await mymessage.add_reaction("🔫")
+        return
+
+    #scans the reminders.txt file and retrieves the datetime object of the reminder scheduled to occur next. 
+    #If there are no reminders, it will return None.
+    def get_next_reminder(self):
+        try:
+            with open(os.path.abspath("misc_data/reminders.txt"),"r") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return
+
+        min_time = None
+
+        for line in lines:
+            if not line.strip() or line.startswith("##"):
+                continue
+            line_dict = json.loads(line.strip())
+            line_time = self.text_to_datetime(line_dict["time"])
+            if not min_time or min_time > line_time:
+                min_time = line_time
+        return min_time
+
+    #Tasks that are run every second
+    @tasks.loop(seconds=1)
+    async def second_loop(self):
+        #start_time = time.time()
+        if datetime.now()>self.next_reminder:
+            await self.check_reminders()
+
+        await self.dumpy_check() #you gotta do what you gotta do
+
+        if not self.scorekeeper.is_saved:
+            self.scorekeeper.save()
+
+        #if datetime.now().second == 0: #stuff to do every minute
+        #    pass
+        #print("LOOP!: "+str(round(time.time()-start_time,4))+" s")
+
+
+    #used to send a message to the bot owner in case of debugging or emergency
+    async def alert_owner(self, text):
+        print("[Notifying Owner]: "+text)
+        owner = self.get_user(self.config.owner_id)
+        owner = owner if owner else await self.fetch_user(self.config.owner_id)
+        dm = await owner.create_dm()
+        await dm.send("ALERT FOR OWNER!\n"+text)
+        return
+
+    #same as alert_owner, but this time alerts all possible developers
+    async def alert_devs(self, text):
+        print("[Notifying Developers]: "+text)
+        for devid in self.config.dev_ids:
+            try:
+                dev = self.get_user(int(devid))
+                dev = dev if dev else await self.fetch_user(int(devid))
+                dm = await dev()
+                await dm.send("ALERT FOR DEVELOPER!\n"+text)
+            except:
+                continue
+        return
+
+
+    async def cmd_whisper(self, message, channel):
+        """
+        Usage:
+            {command_prefix}whisper [user id] [message]
+
+        Sends an anonymous whisper to the designated user. The user may reply to the whisper, but your identity will be hidden from them.
+        """
+        try:
+            inputs = message.content.split(" ",2)
+            inputs[1] = inputs[1].strip()
+        except IndexError:
+            await channel.send("You didn't include enough input fields. Try using `{}help whisper` for more information.".format(self.config.command_prefix),delete_after = 60)
+            return
+        try:
+            sender = message.author
+            if not self.is_valid_id(inputs[1].strip()):
+                raise ValueError("Invalid id input")
+            receiver = self.get_user(int(inputs[1]))
+            receiver = receiver if receiver else await self.fetch_user(int(inputs[1]))
+            if not receiver:
+                raise TypeError("Cannot find that user")
+            elif receiver.bot:
+                raise TypeError("Cannot whisper to bots")
+            if len(inputs[2])>1000: #It cannot go much higher than this
+                raise IndexError("Whisper text is too long")
+
+            await self.send_whisper(sender, receiver, inputs[2])
+            await message.add_reaction("✉️")
+            await message.add_reaction("✅")
+        except ValueError:
+            await channel.send("That was not a valid user ID.",delete_after=60)
+            return
+        except TypeError:
+            await channel.send("Sorry, but I could not find that person (you either mistyped or they are a bot).",delete_after=60)
+            return
+        except IndexError:
+            await channel.send("Sorry, but that whisper is too long.",delete_after=60)
+            return
+        except:
+            print("WHISPER EXCEPTION:")
+            await channel.send("Sorry, but I could not send a message to that user. Something went horribly wrong.",delete_after=60)
+            raise #TODO - remove this when we know it's stable
+            return
+        return
+
+    #if message replies to a whisper, returns the log dict referencing the whisper (String). Otherwise returns None.
+    def replies_to_whisper(self, message):
+        if not (message.reference and message.reference.resolved):
+            return None
+        reference_id = message.reference.message_id
+        with open(os.path.abspath("misc_data/whispers.txt"),"r") as f:
+            lines = f.readlines()
+        for line in lines:
+            if not line.strip() or line.startswith("##"):
+                continue
+            dicty = json.loads(line.strip())
+            if dicty["message_id"] == reference_id:
+                return dicty
+        return None
+
+    #if message is a whisper, returns the log dict referencing the whisper (String). Otherwise returns None.
+    def is_whisper(self, message):
+        reference_id = message.id
+        with open(os.path.abspath("misc_data/whispers.txt"),"r") as f:
+            lines = f.readlines()
+        for line in lines:
+            if not line.strip() or line.startswith("##"):
+                continue
+            dicty = json.loads(line)
+            if dicty["message_id"] == reference_id:
+                return dicty
+        return None
+
+
+    #sends a new whisper to a person and logs the whisper's data. Format: [senderID;receiverID;whisperMessageID;replyToMessageID/None;message_content]
+    #sender, receiver -- User objects, the sender and receiver
+    #text -- string, the message to send as a whisper
+    #replyToMessage -- Message object, the message object of the original whisper. Will be None if the whisper is not a reply to another whisper.
+    #returns the message object of the sent whisper
+    async def send_whisper(self, sender, receiver, text, replyToMessage=None):
+
+        dm_channel = await receiver.create_dm()
+
+        if not replyToMessage:
+            if len(text)<200:
+                embed = discord.Embed(title=text,color=discord.Color.from_rgb(179, 179, 179))
+            else:
+                embed = discord.Embed(title="_ _",color=discord.Color.from_rgb(179, 179, 179))
+                embed.add_field(name="_ _",value=text)
+            embed.set_author(name="Whisper:",icon_url="https://cdn.discordapp.com/attachments/886765649827872820/926492273745723402/PsPsPsPs.jpeg")
+            #embed.add_field(name = text, value = "(This text was sent to you anonymously)")
+            embed.set_footer(text="This message was sent to you anonymously. Reply to this message to respond to the sender. (Note: All whispers are recorded, so behave)")
+        else:
+            reference_dict = self.is_whisper(replyToMessage)
+            sample_text = reference_dict["message"]
+            if len(text)<200:
+                embed = discord.Embed(title=text,color=discord.Color.from_rgb(130, 130, 130))
+            else:
+                embed = discord.Embed(title="_ _",color=discord.Color.from_rgb(130, 130, 130))
+                embed.add_field(name="_ _",value=text,inline=False)
+            embed.set_author(name="Message:",icon_url="https://cdn.discordapp.com/attachments/886765649827872820/926492212970287195/PsPsPsPs2.jpeg")
+            embed.add_field(name = "\n(In response to your previous whisper:)", value = sample_text[0:10]+"..." if len(sample_text)>10 else sample_text, inline=False)
+            embed.set_footer(text="Reply to this message to respond to the sender. (Note: All whispers are logged, so behave)")
+
+        mymessage = await dm_channel.send("Pspspspsps!",embed=embed)
+
+        #Log the whisper
+        log_dict = {"sender":sender.id, "receiver":receiver.id, "message_id":mymessage.id, "reply_id":"None" if not replyToMessage else replyToMessage.id, "message":text}
+        with open(os.path.abspath("misc_data/whispers.txt"),"a") as f:
+            f.write(json.dumps(log_dict)+"\n")
+        return mymessage
+
+
+    def update_horse_plinko(self, board):
+        nohorse = True
+        newboard=list(board) #this actually does nothing, so ill just iterate in reverse
+        for i in range(len(board)-1,-1,-1):
+            line = board[i]
+            for j in range(len(line)-1,-1,-1):
+                if not board[i][j]==2: #ignore non-horses
+                    continue
+                #---horse can be assumed after this point---
+                nohorse=False
+                if i==len(board)-1: #horse dies at the bottom
+                    newboard[i][j]=0
+                    continue
+                #---not on bottom row can be assumed after this point---
+                if board[i+1][j]==0: #horse over empty space - drops down
+                    newboard[i+1][j]=2
+                    newboard[i][j]=0
+                elif board[i+1][j]==1: #horse above peg - do peg logic
+                    left = True if (j>0 and board[i+1][j-1]==0) else False              #horse can fall left
+                    right = True if (j<len(line)-1 and board[i+1][j+1]==0) else False   #horse can fall right
+                    if left and right: #if both, pick one
+                        chance = random.choice([True, False])
+                        left,right = chance, not chance
+                    if left and not right:
+                        newboard[i][j]=0
+                        newboard[i+1][j-1]=2
+                    elif right and not left:
+                        newboard[i][j]=0
+                        newboard[i+1][j+1]=2
+
+        return None if nohorse else newboard #signal that all horses are dead by returning None
+
+
+    async def cmd_plinko(self, message, channel):
+        """
+        Usage:
+            {command_prefix}plinko
+            {command_prefix}plinko [horse emoji] [peg emoji] [fire emoji] [title text]
+
+        does horse plinko
+        optionally add your favorite emojis to plinko them too
+        """
+        #boolean for if an input is valid for horse plinko. Works for single characters, emojis, and guild custom emojis.
+        def is_valid_plinko_emoji(text):
+            return len(text)==1 or (text.startswith(":") and text.endswith(":")) or (text.startswith("<") and text.endswith(">") and ":" in text)
+
+        #converts numerical plinko board into a text message with selected emojis
+        def board_to_text(board, horse_emoji=":racehorse:", peg_emoji=":white_circle:", fire_emoji=":fire:", title="HORSE PLINKO"):
+            output = " ==="+title.upper()+"===\n "
+            for line in board:
+                for n in line:
+                    output+="     _ _" if n==0 else (peg_emoji if n==1 else horse_emoji)
+                output+="\n_ _"
+            output+" "
+            for i in range(7):
+                output+=fire_emoji
+            return output
+
+        def update_horse_plinko(board):
+            nohorse = True
+            newboard=list(board) #this actually does nothing, so ill just iterate in reverse
+            for i in range(len(board)-1,-1,-1):
+                line = board[i]
+                for j in range(len(line)-1,-1,-1):
+                    if not board[i][j]==2: #ignore non-horses
+                        continue
+                    #---horse can be assumed after this point---
+                    nohorse=False
+                    if i==len(board)-1: #horse dies at the bottom
+                        newboard[i][j]=0
+                        continue
+                    #---not on bottom row can be assumed after this point---
+                    if board[i+1][j]==0: #horse over empty space - drops down
+                        newboard[i+1][j]=2
+                        newboard[i][j]=0
+                    elif board[i+1][j]==1: #horse above peg - do peg logic
+                        left = True if (j>0 and board[i+1][j-1]==0) else False              #horse can fall left
+                        right = True if (j<len(line)-1 and board[i+1][j+1]==0) else False   #horse can fall right
+                        if left and right: #if both, pick one
+                            chance = random.choice([True, False])
+                            left,right = chance, not chance
+                        if left and not right:
+                            newboard[i][j]=0
+                            newboard[i+1][j-1]=2
+                        elif right and not left:
+                            newboard[i][j]=0
+                            newboard[i+1][j+1]=2
+            return None if nohorse else newboard #signal that all horses are dead by returning None
+
+
+        info = list(filter(lambda x: x, message.content.split(" ")))
+
+        #print(info)
+        horse_emoji = ":racehorse:"
+        peg_emoji = ":white_circle:"
+        fire_emoji = ":fire:"
+        title = "HORSE PLINKO"
+        all_parsed = False
+        if len(info)>1 and is_valid_plinko_emoji(info[1]):
+            horse_emoji = info[1]
+        elif len(info)>1:
+            title=" ".join(info[1:])
+            all_parsed=True
+        if len(info)>2 and is_valid_plinko_emoji(info[2]) and not all_parsed:
+            peg_emoji = info[2]
+        elif len(info)>2 and not all_parsed:
+            title=" ".join(info[2:])
+            all_parsed=True
+        if len(info)>3 and is_valid_plinko_emoji(info[3]) and not all_parsed:
+            fire_emoji = info[3]
+        elif len(info)>2 and not all_parsed:
+            title=" ".join(info[3:])
+            all_parsed=True
+        if len(info)>4 and not all_parsed:
+            title = " ".join(info[4:])
+
+        #0-space, 1-peg, 2-horse
+        start = random.choice([[2,0,0,0,0,0,0],[0,2,0,0,0,0,0],[0,0,2,0,0,0,0],[0,0,0,2,0,0,0],[0,0,0,0,2,0,0],[0,0,0,0,0,2,0],[0,0,0,0,0,0,2],[2,0,2,0,2,0,2],[0,2,0,2,0,2,0],[2,2,2,2,2,2,2]])
+        board = [start,[0,1,0,1,0,1,0],[0,0,0,0,0,0,0],[1,0,1,0,1,0,1],[0,0,0,0,0,0,0],[0,1,0,1,0,1,0],[0,0,0,0,0,0,0],[1,0,1,0,1,0,1],[0,0,0,0,0,0,0]]
+        mymessage = await channel.send(board_to_text(board, horse_emoji=horse_emoji, peg_emoji=peg_emoji, fire_emoji=fire_emoji, title=title))
+        while board:
+            try:
+                await mymessage.edit(content=board_to_text(board, horse_emoji=horse_emoji, peg_emoji=peg_emoji, fire_emoji=fire_emoji, title=title))
+            except discord.errors.NotFound: #the message was deleted or something 
+                return
+            await asyncio.sleep(1)
+            board = update_horse_plinko(board)
+        await asyncio.sleep(5)
+        await mymessage.delete()
+        return
+
+    @dev_only
+    async def cmd_weather(self, message, channel):
+        """
+        Usage:
+            {command_prefix}weather
+            {command_prefix}weather [location name]
+        Gives you the current weather. Defaults to Westford if no location is specified.
+        TODO - give more specific location info in output. Currently, it may give you a different place with the same name and you'll never know.
+        TODO - more data and stuff idk
+        """
+        mymessage = await channel.send("Fetching weather...")
+        place = "Westford"
+        if len(message.content.strip().split(" "))>1:
+            place = message.content.split(" ")[1]
+        weather_info = (await self.run_cli("curl wttr.in/"+place+"?0T"))[0] #TODO - change output format to get other cool stuff
+        #print(weather_info)
+        title = weather_info.split("\n",1)[0] #it's pretty safe to assume there will be a \n, at least for now
+        weather = weather_info.split("\n",1)[1]
+        try:
+            embed = discord.Embed()
+            embed.add_field(name=title, value = "```"+weather+"```")
+            embed.set_footer(text="(sourced from wttr.in)")
+            await mymessage.edit(content=None,embed=embed)
+        except: #happens when the input location is bad, causing wttr.in to default to Oymyakon, creating an embed that exceeds discord's character limit.
+            await channel.send("Sorry, something went wrong.",delete_after=60)
+        return
+        
+
+    @dev_only
+    async def cmd_archive(self, message, channel):
+        """
+        Usage:
+            {command_prefix}archive
+
+        Saves a snapshot of the current channel into the bnuuy's archive.
+        Does not save images or attachments, but does save their urls.
+        This command may take several minutes to finish running.
+        """    
+        await message.add_reaction("💬")
+        start_time = time.time()
+        try:
+            print("ARCHIVING HISTORY FOR: "+str(channel.id))
+            lines = []
+            lines.append("##======================================================##\n")
+            lines.append("##Archive for "+str(channel.id)+" AKA "+channel.name+"\n")
+            lines.append("##Guild: "+str(channel.guild.id)+" AKA "+channel.guild.name+"\n")
+            lines.append("##Date: "+datetime.now().strftime("%m/%d/%Y at %H:%M:%S")+"\n")
+            lines.append("##======================================================##\n##\n")
+            lines.append("##MEMBERS:\n")
+            for m in channel.members:
+                mdict = {}
+                mdict["name"] = m.name
+                mdict["nick"] = m.nick
+                mdict["id"] = str(m.id)
+                mdict["avatar_url"] = str(m.avatar_url)
+                lines.append(json.dumps(mdict)+"\n")
+
+            lines.append("##\n##MESSAGES:\n")
+            async for m in channel.history(limit=None,oldest_first=True):
+                mdict = {}
+                mdict["date"] = m.created_at.strftime("%m/%d/%Y at %H:%M:%S")
+                mdict["author"] = str(m.author.id)
+                mdict["id"] = str(m.id)
+                mdict["content"] = m.content
+                if len(m.attachments)>0:
+                    mdict["attachments"] = [att.url for att in m.attachments]
+                if len(m.embeds)>0:
+                    mdict["embeds"] = [str(embed.to_dict()) for embed in m.embeds]
+                if len(m.reactions)>0:
+                    mdict["reactions"] = [str(r.emoji)+";"+str(r.count) for r in m.reactions]
+                if m.reference and m.reference.resolved:
+                    mdict["reference"] = str(m.reference.message_id)
+                lines.append(json.dumps(mdict)+"\n")
+            with open(os.path.abspath("channel_archives/"+str(channel.id)+".txt"),"w") as f:
+                f.writelines(lines)
+            print("DONE")
+        except:
+            print("ERROR WHILE ARCHIVING")
+            await message.add_reaction("‼️")
+            raise
+            return
+        await message.clear_reactions()
+        await message.add_reaction("✅")
+        await channel.send("Channel archived in "+str(round(time.time()-start_time,2))+" seconds")
+  
+        return
+
+    async def cmd_emojify(self, message, channel):
+        """
+        Usage:
+            {command_prefix}emojify [text]
+            {command_prefix}emojify (replies to another message)
+
+        Emojifies the input text.
+        If you use the command as a reply to another message, it will emojify the text of that message instead.
+        Generation algorithm is copied straight from https://github.com/Kevinpgalligan/EmojipastaBot
+        The emoji list is also from there, but it's been manually trimmed down slightly.
+        The emojis are trained from reddit posts - so they're kinda erratic.
+
+        Experimental:
+        If you use the command as a reply to another message that contains just images, it will emojify any text that was parsed from the images 
+        Note: Image parsed text only works if the images were sent in the last day, and the images were not sent as urls. 
+        You may need to wait a minute for the rabbit to read the image.
+        """
+
+        if not (message.reference and message.reference.resolved): #parse the input text regularly
+            try:
+                message_text = message.content.strip().split(" ",1)[1]
+            except IndexError:
+                await channel.send("Give me some text to emojify!",delete_after=30)
+                return
+
+        else: #use text from a replied message
+            old_message = message.reference.cached_message
+            old_message = old_message if old_message else (await channel.fetch_message(message.reference.message_id))
+            message_text = old_message.content
+            if not message_text: #try to find attachments that may have been parsed
+                file_list = os.listdir(os.path.abspath("image_cache"))
+                cache_file = "out"+str(old_message.id)+".txt"
+                if cache_file in file_list:
+                    with open(os.path.abspath("image_cache/"+cache_file),"r") as f:
+                        message_text += "".join(f.readlines())
+                else:
+                    if len(old_message.attachments)>0:
+                        await channel.send("I couldn't find anything to emojify.\nIf you're trying to emojify text from an image, make sure the image was sent *today* (and not by a bot).",delete_after=30)
+                    else:
+                        await channel.send("I couldn't find anything to emojify.",delete_after=30)
+                    return
+
+
+        emojified_text = EmojipastaGenerator.of_default_mappings().generate_emojipasta(message_text)
+        if not emojified_text.strip():
+            await channel.send("I couldn't find any text to emojify, sorry.", delete_after=30)
+            return
+        splits = self.split_long_text(emojified_text)
+        try:
+            for split in splits:
+                await channel.send(split)
+        except discord.errors.HTTPException:
+            await channel.send("Something went wrong. The emojified text was probably too long to send through discord. Try breaking it up into several smaller messages for me.",delete_after=30)
+        return
+
+    @dev_only
+    async def cmd_reloadscores(self, message=None):
+        """
+        Usage:
+            {command_prefix}reloadscores
+
+        Force-reloads all scoreboards from disk.
+        """
+        self.scorekeeper.load()
+        if message:
+            await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_editscore(self, message, channel):
+        """
+        Usage:
+            {command_prefix}editscore [user id] [scoreboard] [number]
+            {command_prefix}editscore [user id] [scoreboard] [number] inc
+            {command_prefix}editscore self [scoreboard] [number]
+
+        Manually edits the specified scoreboard value for a user. 
+        Including "inc" at the end will increment the existing score by the specified value. Otherwise the previous score will be overwritten.
+        Make sure you spell the scoreboard name correctly or it will make a new scoreboard file.
+        """
+        #await self.cmd_reloadscores()
+        info = list(filter(lambda x: x, message.content.lower().split(" ")))
+        info[1] = str(message.author.id) if info[1]=="self" else info[1]
+        increment = info[-1].startswith("inc")
+        if not self.is_valid_id(info[1]):
+            await channel.send("That's not a valid user id",delete_after=30)
+            return
+        try:
+            id = int(info[1])
+            value = info[3]
+            if value.isdigit():
+                value = int(info[3]) #cast to int if possible
+            else:
+                try:
+                    value = float(value) #cast to float if possible
+                except:
+                    pass
+        except:
+            await channel.send("Those inputs couldn't be parsed, sorry", delete_after=30)
+            return
+        old_score = self.getScoreboard(id, info[2])
+        try:
+            new_score = self.changeScoreboard(id, info[2], value=value, increment=increment)
+        except TypeError:
+            await channel.send("That score could not be changed due to incompatable incrementables. (old score type: "+str(type(old_score))+" )")
+            return
+        await channel.send("The user's "+info[2]+" score has been changed from "+str(old_score)+" to "+str(new_score) + "  (type : "+str(type(new_score))+" )")
+        return
+
+    @dev_only
+    async def cmd_createwebhook(self, message, channel):
+        """
+        Usage:
+            {command_prefix}createwebhook
+            {command_prefix}createwebhook [name]
+            {command_prefix}createwebhook [name] [avatar url] - CURRENTLY BROKEN
+
+        Creates a webhook for the current channel with name and avatar. Default name is "Default Name". Default avatar is None.
+        There's also currently no way to remove the webhooks unless you're an admin, so don't use this too often.
+        """
+        split = message.content.strip().split(" ")
+        name = "DefaultName" if len(split)<=1 else split[1]
+        avatar = None if len(split)<=2 else split[2]
+        if len(split)>3:
+            await channel.send("That wasn't a valid input",delete_after=30)
+            return
+        try:
+            #print(avatar)
+            hook = await channel.create_webhook(name=name, avatar=str.encode(avatar) if avatar else None, reason = "Because I said so.")
+        except:
+            await channel.send("There was a problem creating the webhook :( (avatar_url input is currently broken btw)")
+            raise
+        await channel.send("The url for the new webhook is: "+hook.url)
+        return
+
+    #Splits a very long string into smaller strings with lengths less than (not equal to, I think) MAX_LEN
+    #will try to split the text along line breaks and then along spaces when possible
+    #returns a list of these shorter strings
+    def split_long_text(self, input, MAX_LEN=1990):
+        output = []
+        shorts = input.split("\n") #split into newlines
+
+        #break the text into progressively smaller chunks as necessary
+        for i in range(len(shorts)-1,-1,-1):
+            shorts[i]=shorts[i]+("\n" if i<len(shorts)-1 else "") #add the newline back
+            short = shorts[i]
+
+            if len(short)>=MAX_LEN: #regular short is too long - break into space-separated "shorters"
+                shorts.pop(i)
+                shorters = short.split(" ")
+                for j in range(len(shorters)-1,-1,-1):
+                    shorters[j] = shorters[j]+(" " if j<len(shorters)-1 else "") #add the space back
+                    shorter = shorters[j]
+
+                    if len(shorter)>=MAX_LEN: #shorter is too long - break into individual characters
+                        for k in range(len(shorter)-1,-1,-1):
+                            shorts.insert(i,shorter[k])
+                    else:
+                        shorts.insert(i,shorter)
+
+
+        #now recombine smaller chunks where possible
+        current = ""
+        for short in shorts:
+            if len(current)+len(short)+2 >= MAX_LEN:
+                output.append(current)
+                current = short
+            else:
+                current += short
+        output.append(current) #don't forgor the last bit
+
+        return output
+            
+
+
+    @dev_only
+    async def cmd_longtest(self, message, channel):
+        """
+        Usage:
+            {command_prefix}longtest [number]
+
+        Used to test long-text breakup function. Generates a very long string of random characters and line breaks. 
+        [number] is the number of characters to use. Defaults to 3000. DO NOT set higher than 20,000, this causes the bot to freeze.
+        """
+        number = 3000
+        input = message.content.strip().split(" ")
+        if len(input)>1:
+            number = int(input[1])
+        characters = "abcdefghijklmnopqrstuvwxyz:;./"
+        output = ""
+        for i in range(number):
+
+            if random.random()<0.000037:
+                output+=""#"\n"
+            else:
+                output += random.choice(characters)
+        shorts = self.split_long_text(output)
+        for short in shorts:
+            print(short)
+            print(len(short))
+            print("\n\n\n")
+            await channel.send(short)
+        return
+
+    #sets the daily wordle word to a new random word. Uses a seed based on the day to ensure the word doesn't change after a reboot.
+    def set_secret_word(self):
+        seed_number = (datetime.now()-datetime(day=1, month=1, year=1)).days #ensures the word doesn't change when bot restarts
+        with open(os.path.abspath("misc_data/wordles.txt"),"r") as f:
+            random.seed(seed_number)
+            word = random.choice(f.readlines())
+        self.secret_word = word.strip()
+        #print("SECRET WORD:  "+word)
+
+    #checks an input guess against the daily secret word
+    #returns a string of emojis representing the guess's closeness to the word
+    def check_wordle_word(self, guess):
+        word = self.secret_word
+
+        output_blocks = ["#" for i in range(len(guess))] #filler spaces
+
+        #pass 1 - check for green squares
+        for i in range(min(len(word),len(guess))):
+            letter = guess[i]
+            if word[i]==letter:
+                output_blocks[i]="G"
+                word = word[:i]+"#"+word[i+1:] #prevent double-counting
+
+        #pass 2 - check for other squares
+        for i in range(len(guess)):
+            letter = guess[i]
+            if i>=len(self.secret_word):
+                output_blocks[i]="N"
+            elif output_blocks[i]=="G":
+                continue
+            elif not letter in word:
+                output_blocks[i]="B"
+            elif letter in word:
+                output_blocks[i]="Y"
+                word = word.replace(letter, "#", 1)
+
+        #convert to emojis
+        output = "".join(output_blocks)
+        output = output.replace("N",":woman_gesturing_no:").replace("G",":green_square:").replace("B",":black_large_square:").replace("Y",":yellow_square:")
+        if guess==self.secret_word:
+            output+="   :100:"
+        return output
+
+
+    async def cmd_wordle(self, message, channel):
+        """
+        Usage:
+            {command_prefix}wordle [guess]
+
+        Submits a wordle guess for your current discord server. The secret word changes every day, and can have 5 or more letters.
+        Once the wordle has been solved for one of your servers, you must wait until the next day to play again.
+        The feedback is as follows:
+        Black square - The letter is not found anywhere in the secret word
+        Yellow square - The letter is present but in the wrong place
+        Green square - The letter is present and in the correct place
+        100 emoji - You have correctly guessed the word! Good job!
+        Woman gesturing "no" - The secret word does not have that many characters.
+        """
+        input = list(filter(lambda x:x, message.content.strip().split(" ")))
+        if len(input)<=1:
+            await channel.send("You need to guess a word.",delete_after=15)
+            return
+        elif len(input)>2:
+            await channel.send("Your guess can only be one word long.", delete_after=30)
+            return
+        guess = input[1].lower()
+        if not guess.isalpha():
+            await channel.send("The secret word will only contain letters from the modern English alphabet.", delete_after=30)
+            return
+        if self.getScoreboard(channel.guild.id, "wordle_finished")>0:
+            await channel.send("Sorry, someone already guessed the secret word in this server today. Try again tomorrow. :heart:", delete_after=30)
+            return
+        elif self.getScoreboard(message.author.id, "wordle_finished")>0:
+            await channel.send("Sorry, but the secret word was already guessed in another server you're in. Try again tomorrow. :wink:", delete_after=30)
+            return
+
+        feedback = self.check_wordle_word(guess)
+        attempts = self.changeScoreboard(channel.guild.id, "wordle_attempts")
+
+        await channel.send("("+str(attempts)+") "+guess+"\: "+feedback)
+        if feedback.endswith(":100:"):
+            await channel.send(message.author.mention+" GUESSED THE WORD! It took this server "+str(attempts)+" tries to guess the word! Good job! :heart:")
+            self.changeScoreboard(message.author.id, "wordle_wins")
+            self.changeScoreboard(channel.guild.id, "wordle_finished")
+            for member in channel.guild.members:
+                self.changeScoreboard(member.id, "wordle_finished")
+
+        return
+
+
+    @dev_only
+    async def cmd_cleanwordlelist(self, message):
+        """
+        Usage:
+            {command_prefix}cleanwordlelist
+        Helper command.
+        Cleans the wordle list and prunes any unusable words. These include words with non-alphabet characters (like hyphens) and words shorter than 5 characters.
+        Only needs to be used once.
+        IMPORTANT: If you restart the bot on the same day you use this command, it might change the daily secret word.
+        """
+        with open(os.path.abspath("misc_data/wordles.txt"),"r") as f:
+            lines = f.readlines()
+        print("Start: "+str(len(lines)))
+        for i in range(len(lines)-1,-1,-1):
+            word = lines[i].strip()
+            if len(word)<5 or not word.isalpha():
+                lines.pop(i)
+            lines[i] = lines[i].lower()
+        print("End: "+str(len(lines)))
+        with open(os.path.abspath("misc_data/wordles.txt"),"w") as f:
+            f.writelines(lines)
+        print("DONE")
+        return
+
+    @owner_only
+    async def cmd_lightoff(self, message):
+        """
+        Usage:
+            {command_prefix}lightoff
+        Turns off the red running indicator light for the raspi.
+        """
+        await self.run_cli("/home/pi/Extras/LightOff.sh")
+        await message.add_reaction("✅")
+        return
+
+    @owner_only
+    async def cmd_lighton(self, message):
+        """
+        Usage:
+            {command_prefix}lighton
+        Turns on the red running indicator light for the raspi.
+        """
+        await self.run_cli("/home/pi/Extras/LightOn.sh")
+        await message.add_reaction("💡")
+        return
+
+    async def cmd_emotelist(self, message, channel):
+        """
+        Usage:
+            {command_prefix}emotelist
+
+        Gives you a list of all the custom emotes that are useable in the current server.
+        Emotes are listed alphabetically.
+        Emotes with asterisks (*) are only useable in the current server.
+        """
+
+        with open(os.path.abspath("emotes/default.txt"),'r') as f:
+            lines = f.readlines()
+        lines_guild=[] #in case the file is not found
+        try:
+            with open(os.path.abspath("emotes/{}.txt".format(channel.guild.id)),'r') as f:
+                lines_guild = f.readlines() #guild-specific emotes list
+        except:
+            pass
+        key_list = []
+        for line in lines:
+            if not line.strip() or line.startswith("##"):
+                continue
+            key_list.append(((line.split(";")[0]).split(",")[0]).replace("{emote}","").lower())
+        for line in lines_guild:
+            if not line.strip() or line.startswith("##"):
+                continue
+            key_list.append(((line.split(";")[0]).split(",")[0]).replace("{emote}","").lower()+"*")
+        key_list.sort()
+        await channel.send(" , ".join(key_list), delete_after=120)
+        return
+
+    async def cmd_addemote(self, message, channel):
+        """
+        Usage:
+            {command_prefix}addemote [trigger] [url]
+            {command_prefix}addemote [trigger1] [trigger2] [trigger3] ...
+            {command_prefix}addemote [trigger] (message has attachment(s))
+            {command_prefix}addemote [trigger] (message replies to a message with attachment(s))
+            {command_prefix}addemote everywhere [trigger] [url]
+
+
+        Adds a new emote to the server's emote list given a list of triggers and images. 
+        If multiple images are provided, it will add all of them to the list (one will be chosen at random when the trigger word is sent)
+        IMPORTANT - the bot does not actually save the image (it just saves the url), so do not delete the original image afterwards or the emote will not work properly.
+        Including the keyword "everywhere" at the start of the command will make the emote useable in all bnuuy servers.
+        """
+        input = list(filter(lambda x: x, message.content.split(" ")))
+        input.pop(0) #(this is just the command text)
+        if len(input)==0:
+            await channel.send("I'm not sure what you want me to do with this...\nAn empty command is useless", delete_after=20)
+            return
+
+        #print(input)
+
+        emote_extensions = [".png",".jpg",".jpeg",".mov",".mp4",".gif",".webp"] #defines what a valid emote file is
+        triggers = []
+        emotes = []
+        everywhere = False
+        if input[0] == "everywhere":
+            everywhere = True
+            input.pop(0)
+
+        #sort inputs into emotes and triggers
+        for i in input:
+            if any(i.endswith(ex) for ex in emote_extensions):
+                emotes.append(i)
+            else:
+                triggers.append(i)
+
+        #grab emotes from attachments
+        for a in message.attachments:
+            if any(a.url.endswith(ex) for ex in emote_extensions):
+                emotes.append(a.url)
+
+        #grab all possible emotes from the reference (if there is one)
+        if message.reference and message.reference.resolved:
+            ref = await channel.fetch_message(message.reference.message_id)
+            for i in list(filter(lambda x: x, ref.content.split(" "))):
+                if any(i.endswith(ex) for ex in emote_extensions):
+                    emotes.append(i)
+            for a in ref.attachments:
+                if any(a.url.endswith(ex) for ex in emote_extensions):
+                    emotes.append(a.url)
+
+        emotes = list(set(emotes))
+        triggers = list(set(triggers))
+
+        if len(emotes)==0: #No emotes provided
+            await channel.send("Sorry, but I couldn't see any valid emotes from what you've provided me.", delete_after=20)
+            return
+        if len(triggers)==0: #No triggers provided
+            await channel.send("Sorry, but I couldn't see any valid triggers from what you've provided me.", delete_after=20)
+            return
+
+        for t in triggers: #Make sure all triggers are valid
+            if ";" in t or "," in t or "{" in t or "}" in t or "##" in t or "\\" in t or ":" in t[1:-2]:
+                await channel.send("Sorry, but one of your provided trigger words contains a reserved character. Commas, semicolons, and colons are not allowed (yet).",delete_after=20)
+                return
+            if len(t) <3: #<3
+                await channel.send("Sorry, but one of your provided trigger words is too short. Please make them at least 5 characters long.",delete_after=20)
+                return
+
+        for t in emotes: #Make sure all emotes are valid
+            if ";" in t or "," in t or "{" in t or "}" in t or "##" in t or "\\" in t:
+                await channel.send("Sorry, but one of your provided emotes contains a reserved character. Commas and semicolons are not allowed (yet).",delete_after=20)
+                return
+
+        for i in range(len(emotes)): #Do the embed fix for all emotes
+            emotes[i] = emotes[i].replace("media.discordapp.net","cdn.discordapp.com")
+
+        for i in range(len(triggers)): #Add the leading and trailing colons if not already present
+            t = triggers[i]
+            if not t.startswith(":"):
+                t = ":"+t
+            if not t.endswith(":"):
+                t = t+":"
+            triggers[i]=t
+
+        line = "{emote},".join(triggers)+"{emote};"+",".join(emotes)+"\n"
+
+        if everywhere:
+            with open(os.path.abspath("emotes/default.txt".format(channel.guild.id)),'a') as f:
+                f.write(line)
+        else:
+            with open(os.path.abspath("emotes/{}.txt".format(channel.guild.id)),'a') as f:
+                f.write(line)
+
+        await message.add_reaction("✅")
+        return
+    
+    @dev_only
+    async def cmd_convertunits(self, message, channel):
+        """
+        Usage:
+            {command_prefix}convertunits [input1] to [input2]
+            {command_prefix}convertunits "[input1]" "[input2]"
+
+        Aliases:
+            {command_prefix}convert
+            {command_prefix}units
+
+        Converts the units of measurement given by [input1] into [input2]. 
+        This command is just a wrapper for the GNUUnits program, which can do a lot of very cool stuff.
+        Use the second format (with quotes around the inputs) if [input1] contain the word " to ". This way the parser does not get confused.
+        """
+        #parse inputs - I may be using strip() a little excessively
+        try:
+            input = message.content.strip()
+            input = input.split(" ",1)[1] #remove command string
+
+            if input.startswith("\""): #Format 2
+                input_split = input.split("\"")
+                input_split = list(filter(lambda x:x.strip(), input_split))
+                input1 = input_split[0].strip()
+                input2 = input_split[1].strip()
+
+            elif " to " in input: #Format 1
+                input_split = input.split(" to ",1)
+                input1 = input_split[0].strip()
+                input2 = input_split[1].strip()
+            else:
+                await channel.send("Sorry, that input format is invalid. Use &help convertunits to see the proper input format.",delete_after=60)
+                return
+        except:
+            await channel.send("Sorry, I could not parse that input. Use &help convertunits to see the proper input format.",delete_after=60)
+            return
+
+        #plug inputs into GNU Units and send results
+        command = "units \""+input1+"\" \""+input2+"\""
+        output = await self.run_cli(command)
+
+        if output[1].strip(): #error occurred
+            await channel.send("There was a problem running those units. See the GNU Units documentation for help.",delete_after=60)
+
+        else: #no errors - send converted units and reciprocal in case someone needs it
+            if output[0].strip().startswith("*"):
+                output_split = output[0].split("\n")
+                result = output_split[0].strip()[1:]
+                reciprocal = output_split[1].strip()[1:]
+                output_string = "Result : "+result+"\n(Reciprocal : "+reciprocal+")"
+            else:
+                output_string = output[0]
+            await channel.send(output_string)
+        return
+
+    @dev_only
+    async def cmd_qrencode(self, message, channel):
+        """
+        Usage:
+            {command_prefix}qrencode [text]
+            {command_prefix}qrencode advanced [text]
+
+        Converts the input text into a qr code and sends it back to the user.
+
+        "advanced" input:
+        This is basically a wrapper for the qrencode library: https://github.com/fukuchi/libqrencode
+        You may use any special flags described in the qrencode documentation (except for -o and -r and any text-output commands)
+        Note: You may also need to include the quotation marks around your text while using "advanced" mode.
+        """
+        #parse inputs
+        unallowed_strings = ["-o ","--output=","-r ","--read-from=","-V","--version","--verbose","-h","--help"]
+        input = message.content.strip()
+        try:
+            input = input.split(" ",1)[1].strip()
+        except:
+            await channel.send("You need to give me text to encode",delete_after=30)
+            return
+        if any(unstr in input for unstr in unallowed_strings):
+            await channel.send("Sorry, but you used a forbidden flag in your input. Please only use flags that affect the qrcode output.",delete_after=60)
+            return
+
+        #filename uses the unique message id to prevent overwrite issues
+        hash_code = str(message.id)
+        filename = os.path.abspath("image_cache/qrcode"+hash_code+".png")
+
+        #generate command and run generation through cli
+        if input.startswith("advanced "):
+            command = "qrencode --output="+filename+" "+input.replace("advanced ","",1) #advanced mode - drops the quotes around the input text
+        else:
+            command = "qrencode --output="+filename+" '"+input+"'"
+        print(command)
+        output = await self.run_cli(command)
+        print(output)
+        if output[1].strip():
+            await channel.send("There was a problem during QR code generation. Perhaps your input was invalid.")
+            return
+        
+        #send image file
+        with open(filename,"rb") as f:
+            await channel.send(file=discord.File(f, "qrcode"+hash_code+".png"))
+        return
+
+    def write_birthday(self, user_id, day, month):
+        """
+        Adds a birthday to the birthdays.json file.
+        Any existing birthdays for the same user will be overwritten.
+        """
+        try:
+            with open(os.path.abspath("misc_data/birthdays.json"),"r") as f:
+                entries = json.load(f)
+        except FileNotFoundError:
+            entries = {}
+        
+        entries.update({str(user_id) : [month,day]})
+
+        with open(os.path.abspath("misc_data/birthdays.json"),"w") as f:
+            json.dump(entries, f)
+
+    def clear_birthday(self, user_id):
+        """
+        Attempts to remove a birthday from birthdays.json.
+        Returns FileNotFoundError if birthdays.json does not exist.
+        Returns KeyError if user_id does not already have a birthday saved.
+        """
+        with open(os.path.abspath("misc_data/birthdays.json"),"r") as f:
+            entries = json.load(f)
+        entries.pop(str(user_id))
+        with open(os.path.abspath("misc_data/birthdays.json"),"w") as f:
+            json.dump(entries, f)
+        
+
+    @dev_only
+    async def cmd_addbirthday(self, message, channel):
+        """
+        Usage:
+            {command_prefix}addbirthday [user_id] [date]
+
+        Adds a user to the birthday list. 
+        [date] follows the format MM/DD (Leading zeros may be omitted)
+        Once added to the birthday list, the user can be removed with the {command_prefix}removebirthday command.
+        If a birthday is already saved for the user, it will be overwritten.
+        """
+        #Read inputs
+        inputs = message.content.strip().lower().split(" ")[1:]
+        inputs = list(filter(lambda x:x, inputs))
+        if not len(inputs)==2:
+            await channel.send("That input has too many parts.",delete_after=30)
+            return
+        inputs[0],inputs[1] = inputs[0].strip(), inputs[1].strip()
+        if not self.is_valid_id(inputs[0]):
+            await channel.send("That was not a valid user id")
+            return
+        user_id = int(inputs[0])
+        try:
+            date_split = inputs[1].split("/")
+            month = int(date_split[0])
+            day = int(date_split[1])
+        except IndexError:
+            await channel.send("I couldn't parse that date",delete_after=30)
+            return
+        
+        #Make entry
+        self.write_birthday(user_id, day, month)
+        await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_removebirthday(self, message, channel):
+        """
+        Usage:
+            {command_prefix}removebirthday [user_id]
+        Removes a userfrom the birthday list. 
+        """
+        inputs = message.content.strip().lower().split(" ")[1:]
+        inputs = list(filter(lambda x:x, inputs))
+        try:
+            if not self.is_valid_id(inputs[0]):
+                raise ValueError
+            user_id = int(inputs[0])
+        except:
+            await channel.send("I had trouble parsing that. Maybe it wasn't a valid ID",delete_after=30)
+            return
+        try:
+            self.clear_birthday(user_id)
+        except FileNotFoundError:
+            await channel.send("I couldn't find the birthdays.json file",delete_after=30)
+            return
+        except KeyError:
+            await channel.send("Nobody with that ID has a birthday stored",delete_after=30)
+            return
+        await message.add_reaction("✅")
+        return
+
+    @dev_only
+    async def cmd_sendbirthdays(self, message):
+        """
+        Usage:
+            {command_prefix}sendbirthdays
+        For debug purposes only. Runs the daily birthday check and sends the birthday messages.
+        """
+        await self.send_birthdays()
+        await message.add_reaction("✅")
+        return
+
+    def get_todays_birthdays(self):
+        """Searches the birthdays.json and returns a list of all user_ids who have a birthday today"""
+        matches = []
+        try:
+            with open(os.path.abspath("misc_data/birthdays.json"),"r") as f:
+                entries = json.load(f)
+        except FileNotFoundError:
+            return []
+        
+        #get today's month and day as ints
+        today = datetime.today()
+        month = int(today.strftime("%m"))
+        day = int(today.strftime("%d"))
+
+        #search through entries
+        for key, val in entries.items():
+            if [month,day]==val: #json imports tuples as lists for some reason
+                matches.append(key)
+
+        return matches
+
+    def get_all_birthdays(self):
+        """Returns a list of all user_ids with saved birthdays"""
+        try:
+            with open(os.path.abspath("misc_data/birthdays.json"),"r") as f:
+                entries = json.load(f)
+        except FileNotFoundError:
+            return []
+        return entries.keys()
+
+    async def send_birthdays(self):
+        """
+        Sends out the birthday messages.
+        If a user is in the birthday.json list, and someone else in the list has a birthday today, the user is notified.
+        """
+        cake_emojis = "🧁🍥🥮🍰🎂🎁🥳🎉"
+        bday_messages = ["Happy bday!!", "Woah! It's your birthday! That's so cool!", 
+            "It's your birthday!", "Happy bday!", "Yoo! Happy birthday!", 
+            "Congrats on the birthday!", "Wishing you a cool and fun birthday!"]
+
+        bdays = self.get_todays_birthdays() #Everyone with a birthday today
+        everyone = self.get_all_birthdays() #Everyone in the list
+
+        if len(bdays)==0 or len(everyone)==0:
+            return #Sad :(
+
+        for id in bdays:
+            user = self.get_user(id)
+            user = user if user else await self.fetch_user(id)
+            if not user:
+                print("Could not find the birthday user "+str(id))
+                continue #If the user does not exist, they will not be included in the birthday fun
+
+            for id2 in everyone: #Notify everyone
+                if id2==id or id2==self.user.id:
+                    continue #Don't notify the person whos bday it is
+                user2 = self.get_user(id2)
+                user2 = user2 if user2 else await self.fetch_user(id2)
+                if not user:
+                    print("Failed to message "+str(id2)+" about the birthday of "+user.name)
+                    continue #User2 could not be found
+                
+                try:
+                    await user2.send("Psst! Today is "+user.mention+" 's birthday!! "+random.choice(cake_emojis))
+                except:
+                    continue #User2 could not be contacted :(
+            
+            #Finally wish the person a happy bday
+            if not user.id == self.user.id:
+                bday_message = random.choice(cake_emojis)+random.choice(cake_emojis)+" "+random.choice(bday_messages)+" "+random.choice(cake_emojis)+random.choice(cake_emojis)
+                try:
+                    await user.send(bday_message)
+                except:
+                    continue
+        return
+
+
+    async def cmd_rdj(self, message, channel):
+        """
+        Usage:
+            {command_prefix}rdj [text]
+            {command_prefix}rdj [font size] [text]
+            {command_prefix}rdj flip [text]
+            {command_prefix}rdj flip [font size] [text]
+
+
+        Make a Robert Downey Jr meme out of your input text.
+        Start the message with "flip" to mirror the image.
+        Start the message with a number (after "flip" if you include it) to set the font size (default is 64).
+        You can do multiple lines by simply using newlines in your message (SHIFT+return on desktop, return on mobile).
+
+        --RDJ code by Katie.
+        """
+
+        #Read input
+        try:
+            text = message.content.strip().split(" ",1)[1]
+        except IndexError:
+            await channel.send("You need to give me text",delete_after=30)
+            return
+        
+        #Parse any extra input stuff
+        flip = text.startswith("flip ")
+        if flip:
+            text = text[5:]
+        font_size = 64
+        try:
+            input_split = text.split(" ",1)
+            if input_split[0].isnumeric():
+                text = input_split[1]
+                font_size = int(input_split[0])
+        except IndexError:
+            pass #Nothing to see here
+
+        try:
+            file_output = rdj(text=text, size=font_size, flip=flip) #in hindsight this didn't need to be its own file
+        except:
+            await channel.send("Woah, something went wrong whil making the image. Maybe try different inputs.", delete_after=30)
+            return
+        try:
+            await channel.send(file=file_output)
+        except:
+            await channel.send("Hmm. I couldn't send you that image for some reason.\nIt's probably my fault.", delete_after=30)
+            return
+        return
+
+
+    def generate_babynames(self, count, boys, girls):
+        """
+        Generates a List of unique-sounding baby names.
+        'boys' and 'girls' are booleans that restrict the algorithm to boy or girl names. Setting both to true will have no effect. Setting both to false will also have no effect.
+        """
+        if not boys and not girls: #hacky fix
+            boys, girls = True, True
+
+        #Read babynames database
+        names = []
+        with open(os.path.abspath("misc_data/babynames.csv"),"r") as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=",")
+            for row in csv_reader:
+                if boys and row[1]=="boy":
+                    names.append(row[0])
+                if girls and row[1]=="girl":
+                    names.append(row[0])
+
+        #Build the unique names
+        results = []
+        while len(results)<count:
+            try:
+                name1 = random.choice(names)
+                name2 = random.choice(names).lower()
+                combo_name = self.portmanteau(name1, name2)
+                if not combo_name or combo_name==name1 or combo_name==name2:
+                    continue
+                results.append(combo_name)
+            except (IndexError, AttributeError):
+                print("There was a problem in the name generator while portmanteauing {} and {}".format(name1,name2))
+        return results
+
+    def generate_password(self, length, noSpecial, lower, allowSimilar):
+        """Gerates a secure random password for the &generate command"""
+        alphanumeric = "abcdefghjkmnpqrstuvwxyz23456789"
+        alphanumeric_similar = "il1o0"
+        special = "@#!?-+=',$%^&*()[]{}/\._"
+        usable = ""+alphanumeric
+        if allowSimilar:
+            usable += alphanumeric_similar
+        if not noSpecial:
+            usable += special
+        
+        result = ""
+        while len(result)<length:
+            newchar = random.choice(usable)
+            if not lower and random.random()<0.5:
+                newchar = newchar.upper()
+            result+=newchar
+        
+        return result
+
+
+    async def cmd_generate(self, message, channel):
+        """
+        Multipurpose String Generator.
+
+        Usage 1:
+            {command_prefix}generate [boy/girl]
+            {command_prefix}generatename [number (#)] [boy/girl]
+
+        Generates a unique-sounding baby name.
+        Specify a number to generate a list of multiple names. 
+        Including the keywords "boy" or "girl" will restrict the algorithm to use gender-specific names as a basis.
+
+        Usage 2:
+            {command_prefix}generatepassword
+            {command_prefix}generatepassword [length (#)] [noSpecial] [lower] [allowSimilar]
+
+        Generates a unique password. Default length is 10.
+        Including the keyword "noSpecial" will restrict the password to only alphanumeric characters.
+        Including the keyword "lower" will prevent the password from using uppercase characters.
+        By default, passwords will never contain character that look similar to other characters (e.g. I and l are not used). Use keyword "allowSimilar" to disable this.
+        The message will auto-delete after one day.
+        """
+        #Read inputs
+        try:
+            tokens = message.content.lower().strip().split(" ")
+            tokens = list(filter(lambda x:x, tokens)) #filter whitespace
+        except IndexError:
+            await channel.send("I had trouble parsing that",delete_after=30)
+            return
+
+
+
+        if tokens[0][1:]=="generatepassword" or "password" in tokens: #generate passwords
+            number = 10
+            for token in tokens:
+                if token.isnumeric():
+                    number = int(token)
+                    break
+            noSpecial = "nospecial" in tokens
+            lower = "lower" in tokens
+            allowSimilar = "allowsimilar" in tokens
+            if number>100:
+                await channel.send("That's too long.", delete_after=30)
+                return
+            result = self.generate_password(number, noSpecial, lower, allowSimilar)
+            await channel.send("Here is your password: "+result, delete_after=3600*24)
+
+
+        else:   #gerneate baby names
+            number = 1
+            for token in tokens:
+                if token.isnumeric():
+                    number = int(token)
+                    break
+            boys = "boys" in tokens or "boy" in tokens
+            girls = "girls" in tokens or "girl" in tokens
+            if number>50:
+                await channel.send("That's too many names.", delete_after=30)
+                return
+            results = self.generate_babynames(number, boys, girls)
+            await channel.send("Here are your names: "+", ".join(results))
+        return
+
+
+    async def cmd_8ball(self, channel):
+        """
+        Usage:
+            {command_prefix}8ball
+
+        Uses cutting-edge technology to shake the magic 8 ball, revealing it's wisdom.
+
+        `(Disclaimer: 8 ball responses are random, and should not be treated as actual wisdom)`
+        """
+
+        ball_responses = [" It is certain","It is decidedly so","Without a doubt",\
+            "Yes definitely","You may rely on it","As I see it, yes","Most likely","Outlook good",\
+                "Yes","Signs point to yes","Reply hazy, try again","Ask again later","Better not tell you now",\
+                    "Cannot predict now","Concentrate and ask again","Don't count on it","My reply is no","My sources say no",\
+                        "Outlook not so good","Very doubtful"]
+        
+        shakes = random.randint(1,5)
+        for i in range(0,shakes):
+            shake_message = "shake "*random.randint(1,5)
+            await channel.send(shake_message, delete_after=30)
+            await asyncio.sleep(random.randint(1,3))
+        await asyncio.sleep(0.5)
+        await channel.send("< "+random.choice(ball_responses)+" >")
+        return
+
+
+        
+
+
+
+        
+
+
+
+

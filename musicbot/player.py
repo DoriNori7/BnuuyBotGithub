@@ -237,6 +237,7 @@ class MusicPlayer(EventEmitter, Serializable):
                         print("[Config:SaveVideos] Could not delete file {}, giving up and moving on".format(
                             os.path.relpath(filename)))
 
+
         self.emit('finished-playing', player=self, entry=entry)
 
     def _kill_current_player(self):
@@ -266,7 +267,7 @@ class MusicPlayer(EventEmitter, Serializable):
         if self.is_dead:
             return
 
-        with await self._play_lock:
+        async with self._play_lock:
             if self.is_stopped or _continue:
                 try:
                     entry = await self.playlist.get_next_entry()
@@ -289,6 +290,14 @@ class MusicPlayer(EventEmitter, Serializable):
                     aoptions = entry.aoptions
                 else:
                     aoptions = "-vn"
+
+                #Edit the metadata so we can see how long since it was last played
+                print("Editing Metadata for "+entry.filename)
+                #os.rename("/home/pi/MusicBot/"+entry.filename,"/home/pi/MusicBot"+entry.filename+".metaedit")
+                #os.rename("/home/pi/MusicBot/"+entry.filename+".metaedit","/home/pi/MusicBot"+entry.filename)
+                os.rename(entry.filename,entry.filename+".metaedit")
+                os.rename(entry.filename+".metaedit",entry.filename)
+                print("Success!")
 
                 log.ffmpeg("Creating player with options: {} {} {}".format(boptions, aoptions, entry.filename))
 

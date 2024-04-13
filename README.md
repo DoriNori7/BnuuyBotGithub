@@ -1,24 +1,43 @@
-# MusicBot
+This is the open-source base code for BnuuyBot, the discord bot that does a bazillion things!
 
-[![GitHub stars](https://img.shields.io/github/stars/Just-Some-Bots/MusicBot.svg)](https://github.com/Just-Some-Bots/MusicBot/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/Just-Some-Bots/MusicBot.svg)](https://github.com/Just-Some-Bots/MusicBot/network)
-[![Python version](https://img.shields.io/badge/python-3.5%2C%203.6%2C%203.7-blue.svg)](https://python.org)
-[![Discord](https://discordapp.com/api/guilds/129489631539494912/widget.png?style=shield)](https://discord.gg/bots)
+================ For anyone looking at the code (please read) ================
+DISCLAIMER! This is a pet project that was never meant to be viewed by other people, nor was it designed to be maintained by anyone other than myself. Feel free to poke around, but proceed with caution!
+Some features may be hard-coded to only run on the original hardware configuration, so you’ll likely need to mess around with it if you actually want to get this thing running. You will also probably need to install some extra dependencies not listed in requirements.txt, as I wrote this code before I understood virtual environments.
 
-MusicBot is the original Discord music bot written for [Python](https://www.python.org "Python homepage") 3.5+, using the [discord.py](https://github.com/Rapptz/discord.py) library. It plays requested songs from YouTube and other services into a Discord server (or multiple servers). Besides, if the queue becomes empty MusicBot will play through a list of existing songs with configuration. The bot features a permission system allowing owners to restrict commands to certain people. As well as playing songs, MusicBot is capable of streaming live media into a voice channel (experimental).
+Bnuuybot is an extensively modified version of https://just-some-bots.github.io/MusicBot/, so it uses python and the discord.py API, which you can find plenty of documentation of online. At some point I switched the music downloader from youtube-dl to yt-dlp, so keep that in mind.
 
-![Main](https://i.imgur.com/FWcHtcS.png)
+To run bnuuy, configure all the stuff (options.ini, etc), and run the run.sh file. 
+I think you’ll need something called “Poetry” to launch; This part was done by Katie, so I have no idea how it works. 
+You’ll also need to provide your own ffmpeg.exe and ffprobe.exe in the bin folder (unless it auto-installs for you)
 
-## Setup
-Setting up the MusicBot is relatively painless - just follow one of the [guides](https://just-some-bots.github.io/MusicBot/). After that, configure the bot to ensure its connection to Discord.
+Most of the important code is located in the musicbot/bot.py file. It’s really long, but if you scroll to the bottom half, you should start to see the basic patterns of creating your own commands. 
+All chat responses (an information about response tags) are located in the responses.txt file.
 
-The main configuration file is `config/options.ini`, but it is not included by default. Simply make a copy of `example_options.ini` and rename it to `options.ini`. See `example_options.ini` for more information about configurations.
+For privacy and security reasons, this version of the bot has a lot of personalized data stripped out, so you’ll need to do a little tinkering to get it to run on its own. Feel free to add your own personal touches to your bnuuy! Notably, you’ll need to provide your own discord bot token in the options.ini file. Other features that have been stripped down for privacy reasons include (but are not limited to): betabnuuy submissions list, custom emote lists, most of the custom chat responses, ratatouille links, all scoreboard data, birthday lists, jeff’s discord id, and the cookies.txt. If I missed anything, please let me know.
 
-### Commands
+Can’t think of a feature to add? I included my old “Bnuuy TODO” file as a pdf. Pick a random bullet point and get to work!
 
-There are many commands that can be used with the bot. Most notably, the `play <url>` command (preceded by your command prefix) will download, process, and play a song from YouTube or a similar site. A full list of commands is available [here](https://just-some-bots.github.io/MusicBot/using/commands/ "Commands").
 
-### Further reading
-
-* [Support Discord server](https://discord.gg/bots)
-* [Project license](LICENSE)
+================ Some fun things Bnuuy can do: ================
++ Music Bot (Join tvoice chat and use &play [song]) 
++ Random bnuuy images (&bnuuy or &betabnuuy) 
++ Submit your own images for the betabnuuy list (send image files to the bnuuy via direct messages, and they will be added automatically) See how many bnuuys people have submitted by using &bnuuyboard! 
++ &emojify [text] will decorate your message with emojis! 
++ Says "funny" stuff! Chat in ⁠bnuuy-general and see how Bnuuy responds! 
++ Occasionally takes a shit! Be the first to clean it up to earn "poop points"! (Check your points with &poops) 
++ Set reminders! (see &help remind) (these will work in direct messages with Bnuuy as well) 
++ Daily wordle clone! (&wordle) 
++ Roll dice for tabletop games! (see &help roll) 
++ Horse Plinko simulator! (&plinko) 
++ Generate a Robert Downey Jr meme! (&rdj [text]) 
++ Makes decisions so you don't have to! (see &help choose) 
++ Generate secure passwords! (see &help generatepassword) 
++ Generate unique names! (&generatename) 
++ Balloon minigame! Don't let it touch the ground! (&balloon) 
++ Play minesweeper! (&minesweeper) 
++ Free hugs! (&hug) 
++ Are you goku? Just keep asking: "Am I Goku?". There's a very small chance you are! Use &goku to see your Goku score! 
++ Custom emotes! Use &emotelist to see the list of emotes you can use. Use &addemote to add to the list! (This feature is kinda broken, please don't abuse it too much) 
++ Typo correction! Mistyped your command? Just edit the original message, and Bnuuy will pretend nothing happened (Only works once per command) 
++ Send anonymous messages to others! (see &help whisper) (Note that the recipient must share at least one server with Bnuuy to receive direct messages) 
++ Other stuff probably
