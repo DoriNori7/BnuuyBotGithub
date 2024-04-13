@@ -19,3 +19,4 @@ config/blacklist.txt
 bin/ffmpeg.exe
 bin/ffprobe.exe
 
+.DS_Store
