@@ -1,0 +1,61 @@
+##TAG USAGE:
+##
+##Use Anywhere:
+##  {a} - always send this (never gets removed by random chance or by another {only} response). Also makes a response immune to typos.
+##  {only} - same function as {a}, but also removes all other nonessential responses
+##  {nodel} - disable auto deletion of message
+##  {deleteorig} - deletes original message (will not respond if it lacks the permission to delete messages)
+##  {fast} - causes the response message to disappear much faster (5 seconds vs the usual 15)
+##  {vfast} - causes the response message to disappear much much faster (1 second)
+##  {rare} - makes the key/response have a 50% chance to not trigger/send - Note: takes precedent over {a} and {only}
+##  {vrare} - same as {rare}, but now the chance is 10% - Note: Can be combined with {rare} to make the total probability 5%
+##
+##Use in keywords only:
+##  {noimg} - will ignore the keyword if it is parsed from an image
+##  {jeff} - keyword will only activate for jeff (hardcoded)
+##  {alone} - ensures the keyword is not part of another larger word
+##  {gokuattempt} - counts the use of the keyword as a goku attempt
+##  {emote} - equivalent to {a}{noimg}{nodel}
+##
+##Use in responses only:
+##  {break} - breaks the response into separate messages (use as many times as you want in a single response)
+##  {goku} - awards the sender with a single goku point
+##  {lead} - attempts to parse the text before the keyword. Will replace the key with this text. (Will not respond on parsing failure)
+##  {trail} - attempts to parse the text after the keyword. Will replace the key with this text. (Will not respond on parsing failure)
+##  {lead1} - similar to {lead}, but will only include the first word/letters adjacent to the keyword
+##  {trail1} - same as {lead1}, but for the {trail} tag
+##  {react}{XXX} - adds an emoji reaction to the original message. (Replace "XXX" with the emoji) (This is not robust - will throw error if improperly formatted) (maximum reactions is 20, but this is fairly arbitrary)
+##  {random} - picks a random word from the text
+##  {author} - fills in the author's nickname or username
+##  {atauthor} - fills in a ping for the author
+##  {time} - fills in the current time (ET timezone)
+##  {date} - fills in the current date (ET timezone)
+##  {weekday} - fills in the current day of the week (ET timezone)
+
+##Note: Most punctuation is cleaned before parsing, so keywords should not contain punctuation
+
+key1{a},key2{a};response1,response2
+gokutest{a}{gokuattempt};goku!!{goku.}
+who am i{noimg}{a};You are {author}!
+atauthortest{a};Hellooo {atauthor} !
+deltest{deleteorig}{a};deltest done
+jefftest{jeff}{a};You are jeff
+testtrail{a},trailtest{a};Trail was {trail}
+testlead{a},leadtest{a};Lead was {lead}
+lead1test{a};lead1 was {lead1}
+trail1test{a};trail1 was {trail1}
+onlytest{only}{a};onlytestyes
+alwaystest{a};always there for you
+alonetest{alone}{a},alone test{alone}{a};alonetest woo
+reacttest{a};poop{react}{💩}{react}{😈}devil,{react}{👽} alien,skull!{react}{💀} skulll!,{react}{🎃}
+fasttest{a}{fast}{alone};fast af boii!
+vfasttest{a};{vfast}very fast af boii!
+raretest{a}{alone}{rare};raretest!
+vraretest{a};very rare test!{vrare}
+datetest{a};the date is {date}
+timetest{a};the time is {time}
+weekdaytest{a};the day is {weekday}
+commatest{a};comma1\,comma1,comma2\,comma2\,
+commatest2{a};comma1\,comma1,comma2\,comma2
+semicolontest{a};sc1\;sc1,sc2\;sc2\;
+semicolontest2{a};sc1\;sc1,sc2\;sc2

@@ -1,0 +1,33 @@
+##This file contains a list of the custom instance variables the bot uses
+##These are hard-coded and you cannot simply add new ones here
+##This file is parsed on startup and when the &reloadconfigs command is run by a dev
+
+##Commands that work anywhere (doesn't include DMS)
+ANYWHERE_COMMANDS::hug,someone,ping,kmaconf,clean,shutdown,repeat,echo,roll,help,quote,addquote,summary,choose,remind,reminders,balloon,whisper,profile,plinko,archive,emojify,wordle,addemote,emotelist,removereminder,convertunits,rdj,longtest,generate,8ball,leaveserver,goku
+
+##Commands that work in DMs
+DM_COMMANDS::hug,ping,betabnuuy,bnuuy,roll,kmaconf,help,summary,reloadconfigs,listlens,bnuuyboard,remind,reminders,regenemotion,echo,echodm,whisper,profile,plinko,emojify,clearytcache,lighton,lightoff,removereminder,choose,convertunits,rdj,addbirthday,generate,8ball,leaveserver,joinserver
+
+##Margaret User IDs separated by commas
+MARGARET_IDS::160146100588773377
+
+##Portmanteau word pairs to ignore (firstword;;secondword) (* is a wild card)
+PORTMANTEAU_EXCLUDES::bella;;swan,thanks;;*,thank;;*,haha;;*,so;;true,so;;true!
+
+##Guild IDs where "fun" actions (portmanteaus, responses, keymash detection) should not be performed, separated by commas
+UNFUN_GUILDS::465947560318730261,1079953536080683038
+
+##Maximum number of goku attempts a user is allowed per day
+MAX_DAILY_GOKUS::200
+
+##Frequency of non-essential responses - ranges from 0 to 1
+RESPONSE_FREQUENCY::0.6
+
+##The number of responses after which the non-essential ones will get culled.
+MAX_RESPONSES::8
+
+##The probability, per second, that the rabbit takes a dump in a server
+POOP_PROBABILITY::0.00001
+
+##How many typos the bot will make in its fun responses. Higher values result in sloppier text. Only takes range of [0,1).
+SLOPPINESS_MULTIPLIER::0.02

@@ -1,0 +1,103 @@
+from . import downloader
+from . import exceptions
+from .aliases import Aliases, AliasesDefault
+from .bot import MusicBot
+from .config import Config, ConfigDefaults
+from .constants import DISCORD_MSG_CHAR_LIMIT
+from .constants import DISCORD_MSG_CHAR_LIMIT, AUDIO_CACHE_PATH
+from .constants import VERSION as BOTVERSION
+from .constructs import BetterLogRecord
+from .constructs import Serializable
+from .constructs import Serializable, Serializer
+from .constructs import SkipState, Response
+from .emojipasta.generator import EmojipastaGenerator
+from .entry import StreamPlaylistEntry
+from .entry import URLPlaylistEntry, StreamPlaylistEntry
+from .exceptions import ExtractionError
+from .exceptions import ExtractionError, WrongEntryTypeError
+from .exceptions import FFmpegError, FFmpegWarning
+from .exceptions import HelpfulError
+from .exceptions import SpotifyError
+from .json import Json
+from .lib.event_emitter import EventEmitter
+from .opus_loader import load_opus_lib
+from .permissions import Permissions, PermissionsDefaults
+from .player import MusicPlayer
+from .playlist import Playlist
+from .robertdowneyjr.rdj import rdj
+from .scorekeeper import Scorekeeper
+from .spotify import Spotify
+from .utils import _get_variable
+from .utils import avg, _func_
+from .utils import get_header
+from .utils import get_header, md5sum
+from .utils import load_file, write_file, fixg, ftimedelta, _func_, _get_variable
+from .utils import objdiff, _get_variable
+from PIL import Image, ImageDraw, ImageFont
+from __future__ import print_function
+from array import array
+from base64 import b64decode
+from collections import defaultdict
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta, datetime
+from discord import FFmpegPCMAudio, PCMVolumeTransformer, AudioSource
+from discord import File
+from discord import opus
+from discord.enums import ChannelType
+from discord.ext import tasks
+from distutils.util import split_quoted
+from enum import Enum
+from functools import wraps
+from glob import glob
+from hashlib import md5
+from io import BytesIO
+from io import BytesIO, StringIO
+from itertools import islice
+from os.path import abspath
+from pathlib import Path
+from quantumrandom import get_data
+from random import shuffle
+from shutil import disk_usage, rmtree
+from shutil import get_terminal_size
+from shutil import rmtree
+from subprocess import check_output
+from textwrap import dedent
+from threading import Thread
+from urllib.error import URLError
+from websockets.exceptions import InvalidState
+from youtube_dl.utils import ExtractorError, DownloadError, UnsupportedError
+import aiohttp
+import argparse
+import asyncio
+import audioop
+import base64
+import codecs
+import collections
+import colorlog
+import configparser
+import csv
+import datetime
+import discord
+import functools
+import inspect
+import io
+import json
+import logging
+import math
+import os
+import os.path
+import pathlib
+import platform
+import pydoc
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import traceback
+import yt_dlp as youtube_dl #sneaky little switcheroo

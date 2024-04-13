@@ -1,0 +1,2 @@
+##Default list of custom emotes that work across all servers
+
