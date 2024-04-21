@@ -59,3 +59,7 @@ commatest{a};comma1\,comma1,comma2\,comma2\,
 commatest2{a};comma1\,comma1,comma2\,comma2
 semicolontest{a};sc1\;sc1,sc2\;sc2\;
 semicolontest2{a};sc1\;sc1,sc2\;sc2
+
+am i goku{noimg}{a}{gokuattempt},i am goku{noimg}{a}{gokuattempt},im goku{noimg}{a}{gokuattempt};no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,no,mo,no.,No,NO!,yes!{break}haha jk!{nodel},yes{goku}{nodel},maybe?,try asking again,fuck you{nodel},please leave me alone{nodel},{atauthor} is not goku{nodel}
+are you goku{noimg};yeah of course,yes! I am!,yea,yes,of course I’m Goku,I’m Goku,yees
+am i not goku{noimg},i am not goku{noimg},am i _not_ goku{noimg};yes
